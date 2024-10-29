@@ -1,0 +1,8 @@
+[package]
+name = "cartographer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+geojson = "0.24.1"
+rocket = "0.5.1"
