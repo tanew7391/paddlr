@@ -1,1 +1,3 @@
 *.drawio
+*_hidden.*
+.vscode/
