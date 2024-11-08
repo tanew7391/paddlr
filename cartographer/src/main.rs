@@ -1,12 +1,14 @@
 #[macro_use]
 extern crate rocket;
 
-use std::{collections::HashMap, error::Error};
 use serde::Deserialize;
 use serde_json::Map;
+use std::{collections::HashMap, error::Error};
 
-use geojson::{feature::Id::Number, Bbox, Feature, FeatureCollection, GeoJson, Geometry, PointType, Value};
-use rocket::{data::{Data, ToByteUnit}};
+use geojson::{
+    feature::Id::Number, Bbox, Feature, FeatureCollection, GeoJson, Geometry, PointType, Value,
+};
+use rocket::data::{Data, ToByteUnit};
 
 const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 
@@ -26,12 +28,14 @@ struct Element {
     geometry: Geometry,
 }
 
-
 async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
-    let bounding_box_as_string = bounding_area.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
-
+    let bounding_box_as_string = bounding_area
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     //TODO: Switch from requesting geoJson from OSM to using GDAL to convert. This will save time when requesting data from OSM
     let query = format!(
@@ -47,8 +51,6 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, B
         bounding_box_as_string, bounding_box_as_string
     );
 
-
-
     println!("Query: \n{query}");
 
     let res = client
@@ -61,31 +63,31 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, B
         .await?;
 
     let json: OSMResponse = serde_json::from_str(&res)?;
-    let features = json.elements.into_iter().map(|element| 
-        Feature {
+    let features = json
+        .elements
+        .into_iter()
+        .map(|element| Feature {
             geometry: Some(element.geometry),
             bbox: None,
             id: match element.id {
                 Some(id) => Some(Number(id.into())),
-                None => None
+                None => None,
             },
             foreign_members: None,
             properties: match element.tags {
                 Some(tags) => Some(tags),
-                None => None
-            }            
-        }
-    ).collect();
+                None => None,
+            },
+        })
+        .collect();
 
     let full_geojson = GeoJson::from(FeatureCollection {
         features,
         bbox: None,
-        foreign_members: None
+        foreign_members: None,
     });
-    
-    Ok(
-        full_geojson
-    )
+
+    Ok(full_geojson)
 }
 
 fn extract_bounding_box_from_multipoint_geometry(
