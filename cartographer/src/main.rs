@@ -1,12 +1,20 @@
 #[macro_use]
 extern crate rocket;
 
+mod convert;
+
+use convert::convert_osmjson_to_geojson;
+use geo::{BoundingRect, Contains, Polygon};
 use serde::Deserialize;
 use serde_json::Map;
 use std::{collections::HashMap, error::Error};
 
+use geo_types::{GeometryCollection, Point};
+
+
 use geojson::{
-    feature::Id::Number, Bbox, Feature, FeatureCollection, GeoJson, Geometry, PointType, Value,
+    feature::Id::Number, quick_collection, Bbox, Feature, FeatureCollection, GeoJson, Geometry,
+    PointType, Value,
 };
 use rocket::data::{Data, ToByteUnit};
 
@@ -45,7 +53,6 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, B
         way["natural"="water"]({:});
         relation["natural"="water"]({:});
         );
-        convert item ::=::,::geom=geom(),_osm_type=type();
         out geom;
         "#,
         bounding_box_as_string, bounding_box_as_string
@@ -61,6 +68,8 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, B
         .await?
         .text()
         .await?;
+
+    convert_osmjson_to_geojson(&res);
 
     let json: OSMResponse = serde_json::from_str(&res)?;
     let features = json
@@ -157,12 +166,97 @@ fn multipoint_to_linestring(geojson: GeoJson) -> Result<GeoJson, Box<dyn Error>>
     Err("Input is not a valid MultiPoint geometry".into())
 }
 
+
+
+fn find_containing_polygon<'a>(
+    point: &Point<f64>,
+    geometries: &'a GeometryCollection<f64>,
+) -> Option<geo_types::Polygon> {
+    // Iterate over each geometry in the collection
+    println!("Searching for location: {:?}", point);
+    println!("Geometry: {:#?}", geometries);
+
+    for geometry in geometries {
+        //println!("Geometry: {:#?}", geometry);
+        //Start debug
+
+
+
+        if let geo::Geometry::GeometryCollection(multipolygon_collection) = geometry {
+            // At this point, all contained geometries should be LineStrings as this is how OSM organizes the data
+            // All contained geometries at this stage belong to the same multipolygon
+            // For now, we'll assume that the first polygon is the bounds of the exterior
+            let mut previous_linestring: Option<&geo::LineString> = None;
+            for geometry in multipolygon_collection {
+                if let geo::Geometry::LineString(linestring) = geometry {
+
+                    //todo: should this be an unwrap. I believe so, since the first coordinate of a given linestring should not be empty. 
+                    // That would signify malformation
+                    let first_coord = linestring.coords().next().expect("Expected line string to contain at least one coordinate");
+                    if let Some(unwrapped_previous_linestring) = previous_linestring {
+                        if unwrapped_previous_linestring.coords().last().unwrap().eq(first_coord) {
+                            //unwrapped_previous_linestring.into_inner().extend(linestring.coords());
+                        }
+                    } 
+
+                    previous_linestring = Some(linestring);
+                } else {
+                    eprintln!("Unknown geo::Geography type when linestring was expected!");
+                }
+            }
+
+        }
+
+        if let geo::Geometry::LineString(linestr) = geometry {
+            let new_polygon = Polygon::new(linestr.clone(), vec![]);
+            println!("Within polygon: {:?}", new_polygon);
+            if let Some(bbox) = geometry.bounding_rect() {
+                println!("Bounding box {:?} :", bbox);
+                if bbox.contains(point) {
+                    println!(
+                        "Bounding box {:?} contains point!, Point is: {:?}",
+                        bbox, point
+                    );
+                    // Perform the more precise contains check
+                    println!("This is for geometry: {:?}", new_polygon);
+                    if new_polygon.contains(point) {
+                        println!("Geometry {:?} contains point!", new_polygon);
+                        return Some(new_polygon); // Return the first containing polygon
+                    }
+                }
+            }
+        }
+
+        /*         //End debug
+        if geometry.contains(point) {
+            println!("Geometry {:?} contains point, before checking the bbox!", geometry.type_id());
+            return Some(geometry); // Return the first containing polygon
+        }
+
+        if let Some(bbox) = geometry.bounding_rect() {
+            if bbox.contains(point) {
+                println!("Bounding box {:?} contains point!", bbox);
+                /* for item in geometry.coords_iter(){
+                    println!("{:?}.into(),", item.x_y());
+                } */
+                // Perform the more precise contains check
+                if geometry.contains(point) {
+                    println!("Geometry {:?} contains point!", geometry);
+                    return Some(geometry); // Return the first containing polygon
+                }
+            }
+        } */
+    }
+    None // No containing polygon found
+}
+
 #[post("/api", data = "<data>")]
 async fn index(data: Data<'_>) -> String {
     let data_string = data.open(1.megabytes()).into_string().await.unwrap();
+    
     let json = data_string.parse::<GeoJson>().unwrap();
 
-    let contained_multipoint_geometry = extract_multipoint_geometry(json).unwrap();
+    let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
 
     let bounding_box: Bbox =
         extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
@@ -171,7 +265,26 @@ async fn index(data: Data<'_>) -> String {
     let associated_water_features_future = get_associated_water_features(bounding_box);
     //line_string_json.unwrap().to_string()
     let associated_water_features = associated_water_features_future.await.unwrap();
-    associated_water_features.to_string()
+    //println!("Water features: {:}", associated_water_features.to_string());
+
+
+    let mut collection: GeometryCollection<f64> =
+        quick_collection(&associated_water_features).unwrap();
+
+    let defined_point = Point::new(
+        contained_multipoint_geometry[0][0],
+        contained_multipoint_geometry[0][1],
+    );
+
+    //println!("After conv: {:#?}", collection);
+
+
+    let possible_containing_polygon = find_containing_polygon(&defined_point, &collection);
+
+    match possible_containing_polygon {
+        Some(polygon) => Value::from(&geo::Geometry::from(polygon)).to_string(),
+        None => associated_water_features.to_string(),
+    }
 }
 
 #[launch]
