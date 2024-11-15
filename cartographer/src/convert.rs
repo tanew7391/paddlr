@@ -2,6 +2,8 @@ use std::{
     borrow::BorrowMut, collections::{HashMap, HashSet}, error::Error
 };
 
+use geo::{LineString, Point};
+use geojson::{GeoJson, Geometry};
 use serde::Deserialize;
 
 pub mod convert {
@@ -10,7 +12,7 @@ pub mod convert {
 
 #[derive(Deserialize, Debug)]
 struct OSMResponse {
-    version: Option<f32>,
+    version: Option<f64>,
     generator: Option<String>,
     osm3s: Option<HashMap<String, String>>,
     elements: Vec<Element>,
@@ -24,13 +26,19 @@ enum Element {
     relation(Relation),
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Node {
     r#type: String,
     id: u64,
-    lat: f32,
-    lon: f32,
+    lat: f64,
+    lon: f64,
     tags: Option<HashMap<String, String>>,
+}
+
+impl From<Node> for geo_types::Point {
+    fn from(node: Node) -> Self {
+        geo_types::Point(geo::Coord { x: node.lon, y: node.lat })
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -78,22 +86,28 @@ struct NodeMember {
     r#type: String,
     r#ref: u64,
     role: String,
-    lat: f32,
-    lon: f32,
+    lat: f64,
+    lon: f64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct Bounds {
-    minlat: f32,
-    minlon: f32,
-    maxlat: f32,
-    maxlon: f32,
+    minlat: f64,
+    minlon: f64,
+    maxlat: f64,
+    maxlon: f64,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Copy)]
 struct Coord {
-    lat: f32,
-    lon: f32,
+    lat: f64,
+    lon: f64,
+}
+
+impl From<Coord> for geo_types::Coord {
+    fn from(co: Coord) -> Self {
+        geo_types::Coord { x: co.lon, y: co.lat }
+    }
 }
 
 fn convert_node_member_to_node(node_member: NodeMember) -> Node {
@@ -119,34 +133,33 @@ fn convert_way_member_to_way(way_member: WayMember) -> Way {
     };
 }
 
-fn combine_ways(original_way: &Way, supplementary_way: Way) -> Way {
-    let mut new_way = original_way.clone();
+fn combine_ways(original_way: &mut Way, supplementary_way: Way) -> &Way {
 
-    if new_way.bounds.is_none() && supplementary_way.bounds.is_some() {
-        new_way.bounds = supplementary_way.bounds;
+    if original_way.bounds.is_none() && supplementary_way.bounds.is_some() {
+        original_way.bounds = supplementary_way.bounds;
     }
 
-    if new_way.geometry.is_none() && supplementary_way.geometry.is_some() {
-        new_way.geometry = supplementary_way.geometry;
+    if original_way.geometry.is_none() && supplementary_way.geometry.is_some() {
+        original_way.geometry = supplementary_way.geometry;
     }
 
-    if new_way.nodes.is_none() && supplementary_way.nodes.is_some() {
-        new_way.nodes = supplementary_way.nodes;
+    if original_way.nodes.is_none() && supplementary_way.nodes.is_some() {
+        original_way.nodes = supplementary_way.nodes;
     }
 
     if supplementary_way.tags.is_some() {
-        if let Some(ref mut original_tags) = new_way.tags {
+        if let Some(ref mut original_tags) = original_way.tags {
             for tag in supplementary_way.tags.unwrap() {
                 if !original_tags.contains_key(&tag.0) {
                     original_tags.insert(tag.0, tag.1);
                 }
             }
         } else {
-            new_way.tags = supplementary_way.tags;
+            original_way.tags = supplementary_way.tags;
         }
     }
 
-    return new_way;
+    return original_way;
 }
 
 fn extract_nodes_ways_relations_from_elements(
@@ -221,47 +234,69 @@ pub fn convert_osmjson_to_geojson(input_json_string: &str) {
         }
     };
 
-    let (ways, nodes, relations) = extract_nodes_ways_relations_from_elements(response.elements);
+    let (mut ways, nodes, relations) = extract_nodes_ways_relations_from_elements(response.elements);
 
     let mut borrowed_ways: HashSet<u64> = HashSet::new();
     let mut borrowed_nodes: HashSet<u64> = HashSet::new();
     for (relation_id, relation) in relations {
         let mut relation_member_nodes: HashMap<u64, Node> = HashMap::new();
-        let mut relation_ways: Vec<Way> = Vec::new();
+        let mut relation_ways: HashMap<u32,Way> = HashMap::new();
+        let mut referenced_relation_ways: HashMap<u32,u64> = HashMap::new();
+        let mut linestrings: Vec<LineString> = vec![];
+        let mut outer_linestring: Option<LineString> = None;
+        let mut points: Vec<Point> = vec![];
+        let mut index = 0;
 
         if relation.members.len() == 0 {
             eprintln!("Relation {:} has no members!", relation_id);
             continue;
         }
 
-        let referenced_way_ids: Vec<u64> = vec![];
         for member in relation.members {
             if let Member::node(node_member_instance) = member {
+                let node_instance = convert_node_member_to_node(node_member_instance);
+                points.push(Point::from(node_instance.clone()));
+                borrowed_nodes.insert(node_instance.id);
+                
+                //TODO: do we need this map?
                 relation_member_nodes.insert(
-                    node_member_instance.r#ref,
-                    convert_node_member_to_node(node_member_instance),
+                    node_instance.id,
+                    node_instance,
                 );
+
             } else if let Member::way(way_member_instance) = member {
                 let way_ref = way_member_instance.r#ref;
-                let original_way_wrapped = ways.get(&way_ref);
-                let relationship_way_instance = convert_way_member_to_way(way_member_instance);
+
+                let is_outer: bool = way_member_instance.role.eq("outer"); 
+
+                let original_way_wrapped = ways.get_mut(&way_ref);
+                let mut relationship_way_instance = convert_way_member_to_way(way_member_instance);
                 if let Some(original_way) = original_way_wrapped {
-                    let mut new_way = combine_ways(original_way, relationship_way_instance);
-                    {
-                        //mutable block
-                        let tet = ways.get_mut(&way_ref).unwrap();
-                        tet = 5;
+                    referenced_relation_ways.insert(index,way_ref);
+                    combine_ways(original_way, relationship_way_instance);
+                    attach_geometry_to_nodes_for_way(original_way, &nodes);
+                    //TODO: test
+                    let geo_linestring = LineString::from(original_way.geometry.clone().unwrap());
+                    if is_outer && outer_linestring.is_none() {
+                        //Here we clone the geometry, expensive
+                        outer_linestring = Some(geo_linestring)
+                    } else {
+                        linestrings.push(geo_linestring);
                     }
-                    new_way = attach_geometry_to_nodes_for_way(new_way, &nodes).unwrap();
-                    relation_ways.push(new_way);
                 } else {
-                    relation_ways.push(relationship_way_instance);
+                    attach_geometry_to_nodes_for_way(&mut relationship_way_instance, &nodes);
+                    //This may not have geometry, but if there does not exist a way external to the relationship, then there should have to be geom
+                    let geo_linestring = LineString::from(relationship_way_instance.geometry.clone().unwrap());
+                    linestrings.push(geo_linestring);
+                    relation_ways.insert(index, relationship_way_instance);
                 }
             }
+            index += 1;
         }
+
         if relation_member_nodes.is_empty() {
             //Only Ways in relation
-            for way in relation_ways {
+            for (_, way) in relation_ways {
                 //Keep track of ways to delete after all relations are processed
                 //There may be more than one relation that uses the same way, which is why we hold onto them for now.
                 borrowed_ways.insert(way.id);
@@ -281,11 +316,11 @@ pub fn convert_osmjson_to_geojson(input_json_string: &str) {
 }
 
 fn attach_geometry_to_nodes_for_way(
-    mut way: Way,
+    way: &mut Way,
     nodes: &HashMap<u64, Node>,
-) -> Result<Way, Box<dyn Error>> {
+){
     if way.geometry.is_some() {
-        return Ok(way); //geometry already attached
+        return; //geometry already attached
     }
     let mut geometry: Vec<Coord> = Vec::new();
     if let Some(node_refs) = &way.nodes {
@@ -296,18 +331,14 @@ fn attach_geometry_to_nodes_for_way(
                     lon: node.lon,
                 });
             } else {
-                return Err(format!("No associated node found for referenced node in way. \n Node ref: {:} \n Way: {:?}", node_ref, way).into());
+                panic!("No associated node found for referenced node in way. \n Node ref: {:} \n Way: {:?}", node_ref, way);
             }
         }
 
         way.geometry = Some(geometry);
-        return Ok(way);
     } else {
-        return Err(format!(
-            "No nodes nor geometry exist for combined way object! \n {:#?}",
-            way
-        )
-        .into());
+        panic!("No nodes nor geometry exist for combined way object! \n {:#?}",
+            way);
     }
 }
 
