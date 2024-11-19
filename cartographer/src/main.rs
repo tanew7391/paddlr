@@ -3,7 +3,7 @@ extern crate rocket;
 
 mod convert;
 
-use convert::convert_osmjson_to_geojson;
+use convert::convert_osmjson_to_geo;
 use geo::{BoundingRect, Contains, Polygon};
 use serde::Deserialize;
 use serde_json::Map;
@@ -69,7 +69,7 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeoJson, B
         .text()
         .await?;
 
-    convert_osmjson_to_geojson(&res);
+    convert_osmjson_to_geo(&res);
 
     let json: OSMResponse = serde_json::from_str(&res)?;
     let features = json

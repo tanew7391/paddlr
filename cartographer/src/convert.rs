@@ -1,9 +1,8 @@
-use std::{
-    borrow::BorrowMut, collections::{HashMap, HashSet}, error::Error
-};
+use std::collections::{HashMap, HashSet};
 
-use geo::{LineString, Point};
-use geojson::{GeoJson, Geometry};
+use geo::{
+    GeometryCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon,
+};
 use serde::Deserialize;
 
 pub mod convert {
@@ -37,7 +36,10 @@ struct Node {
 
 impl From<Node> for geo_types::Point {
     fn from(node: Node) -> Self {
-        geo_types::Point(geo::Coord { x: node.lon, y: node.lat })
+        geo_types::Point(geo::Coord {
+            x: node.lon,
+            y: node.lat,
+        })
     }
 }
 
@@ -106,7 +108,22 @@ struct Coord {
 
 impl From<Coord> for geo_types::Coord {
     fn from(co: Coord) -> Self {
-        geo_types::Coord { x: co.lon, y: co.lat }
+        geo_types::Coord {
+            x: co.lon,
+            y: co.lat,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+struct IncompletePolygon {
+    exterior: LineString,
+    interior: Vec<LineString>,
+}
+
+impl From<IncompletePolygon> for geo_types::Polygon {
+    fn from(polygon_incomplete: IncompletePolygon) -> Self {
+        geo_types::Polygon::new(polygon_incomplete.exterior, polygon_incomplete.interior)
     }
 }
 
@@ -134,7 +151,6 @@ fn convert_way_member_to_way(way_member: WayMember) -> Way {
 }
 
 fn combine_ways(original_way: &mut Way, supplementary_way: Way) -> &Way {
-
     if original_way.bounds.is_none() && supplementary_way.bounds.is_some() {
         original_way.bounds = supplementary_way.bounds;
     }
@@ -218,7 +234,7 @@ fn extract_nodes_ways_relations_from_elements(
     return (ways, nodes, relations);
 }
 
-pub fn convert_osmjson_to_geojson(input_json_string: &str) {
+pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
     let jd = &mut serde_json::Deserializer::from_str(input_json_string);
     println!("Json string: {:#?}", input_json_string);
 
@@ -229,21 +245,22 @@ pub fn convert_osmjson_to_geojson(input_json_string: &str) {
         Err(err) => {
             eprintln!("{:?}", err);
             let path = err.path().to_string();
-            assert_eq!(path, "dependencies.serde.version");
-            return;
+            panic!("dependencies.serde.version, should eq {:}", path);
         }
     };
 
-    let (mut ways, nodes, relations) = extract_nodes_ways_relations_from_elements(response.elements);
+    let (mut ways, mut nodes, relations) =
+        extract_nodes_ways_relations_from_elements(response.elements);
 
     let mut borrowed_ways: HashSet<u64> = HashSet::new();
     let mut borrowed_nodes: HashSet<u64> = HashSet::new();
+    let mut geometry_collection: GeometryCollection<f64> = GeometryCollection::default();
     for (relation_id, relation) in relations {
-        let mut relation_member_nodes: HashMap<u64, Node> = HashMap::new();
-        let mut relation_ways: HashMap<u32,Way> = HashMap::new();
-        let mut referenced_relation_ways: HashMap<u32,u64> = HashMap::new();
+        //let mut relation_member_nodes: HashMap<u64, Node> = HashMap::new();
+        //let mut relation_ways: HashMap<u32, Way> = HashMap::new();
+        let mut referenced_relation_ways: HashMap<u32, u64> = HashMap::new();
         let mut linestrings: Vec<LineString> = vec![];
-        let mut outer_linestring: Option<LineString> = None;
+        let mut incomplete_polygons: Vec<IncompletePolygon> = vec![];
         let mut points: Vec<Point> = vec![];
         let mut index = 0;
 
@@ -257,68 +274,199 @@ pub fn convert_osmjson_to_geojson(input_json_string: &str) {
                 let node_instance = convert_node_member_to_node(node_member_instance);
                 points.push(Point::from(node_instance.clone()));
                 borrowed_nodes.insert(node_instance.id);
-                
-                //TODO: do we need this map?
-                relation_member_nodes.insert(
-                    node_instance.id,
-                    node_instance,
-                );
 
+                //TODO: do we need this map?
+                //relation_member_nodes.insert(node_instance.id, node_instance);
             } else if let Member::way(way_member_instance) = member {
                 let way_ref = way_member_instance.r#ref;
 
-                let is_outer: bool = way_member_instance.role.eq("outer"); 
+                let is_outer = way_member_instance.role.eq("outer");
+                let is_inner = way_member_instance.role.eq("inner");
+
+                let geo_linestring: LineString;
 
                 let original_way_wrapped = ways.get_mut(&way_ref);
                 let mut relationship_way_instance = convert_way_member_to_way(way_member_instance);
                 if let Some(original_way) = original_way_wrapped {
-                    referenced_relation_ways.insert(index,way_ref);
+                    referenced_relation_ways.insert(index, way_ref);
                     combine_ways(original_way, relationship_way_instance);
                     attach_geometry_to_nodes_for_way(original_way, &nodes);
+                    borrowed_ways.insert(original_way.id);
                     //TODO: test
-                    let geo_linestring = LineString::from(original_way.geometry.clone().unwrap());
-                    if is_outer && outer_linestring.is_none() {
-                        //Here we clone the geometry, expensive
-                        outer_linestring = Some(geo_linestring)
-                    } else {
-                        linestrings.push(geo_linestring);
-                    }
+                    geo_linestring = LineString::from(original_way.geometry.clone().unwrap());
                 } else {
                     attach_geometry_to_nodes_for_way(&mut relationship_way_instance, &nodes);
                     //This may not have geometry, but if there does not exist a way external to the relationship, then there should have to be geom
-                    let geo_linestring = LineString::from(relationship_way_instance.geometry.clone().unwrap());
+                    geo_linestring =
+                        LineString::from(relationship_way_instance.geometry.clone().unwrap());
+                    //relation_ways.insert(index, relationship_way_instance);
+                }
+
+                if is_outer || is_inner {
+                    add_linestring_to_polygons(geo_linestring, &mut incomplete_polygons, is_outer);
+                } else {
                     linestrings.push(geo_linestring);
-                    relation_ways.insert(index, relationship_way_instance);
                 }
             }
             index += 1;
         }
 
-        if relation_member_nodes.is_empty() {
+        if borrowed_nodes.is_empty() {
             //Only Ways in relation
-            for (_, way) in relation_ways {
-                //Keep track of ways to delete after all relations are processed
-                //There may be more than one relation that uses the same way, which is why we hold onto them for now.
-                borrowed_ways.insert(way.id);
-            }
-        } else if relation_ways.is_empty() {
-            //Only Nodes in relation
+
+            //https://wiki.openstreetmap.org/wiki/Relation:multipolygon#Two_disjunct_outer_rings
+
+            let multi_polygon =
+                MultiPolygon::from_iter(incomplete_polygons.into_iter().map(|x| Polygon::from(x)));
+
+            geometry_collection
+                .0
+                .push(geo::Geometry::MultiLineString(MultiLineString::new(
+                    linestrings,
+                )));
+
+            geometry_collection
+                .0
+                .push(geo::Geometry::MultiPolygon(multi_polygon));
+
+        } else if borrowed_ways.is_empty() {
+
+            geometry_collection
+                .0
+                .push(geo::Geometry::MultiPoint(MultiPoint::new(points)));
+
         } else {
             //Both nodes and ways in relation
             //Dissolve relationship and add all nodes and ways to the main node and way hashmaps (geojson has no feature for this relationship)
             //ways.insert(1, relation_ways.remove(0));
+            for incomplete_polygon in incomplete_polygons {
+                geometry_collection.0.push(geo::Geometry::Polygon(incomplete_polygon.into()));
+            }
+
+            for linestring in linestrings {
+                geometry_collection.0.push(
+                    geo::Geometry::LineString(linestring)
+                )
+            }
+
+            for point in points {
+                geometry_collection.0.push(
+                    geo::Geometry::Point(point)
+                );
+            }
         }
     }
 
-    /*
-    let osmjson: OSMResponse = serde_json::from_str(input_json_string).unwrap();
-    println!("Deserialized: {:#?}", osmjson); */
+    for way_id in borrowed_ways.iter() {
+        ways.remove(way_id);
+    }
+
+    for (_way_id, way) in ways.iter_mut() {
+        //ensure all geometry is attached to ways before deleting nodes
+        attach_geometry_to_nodes_for_way(way, &nodes);
+    }
+
+    for node_id in borrowed_nodes.iter() {
+        nodes.remove(node_id);
+    }
+
+    for (_way_id, way) in ways.drain() {
+        geometry_collection.0.push(geo::Geometry::LineString(LineString::from(way.geometry.unwrap())));
+    }
+
+    for (_node_id, node) in nodes.drain() {
+        geometry_collection.0.push(geo::Geometry::Point(Point::from(node)));
+    }
+
+
+    return geometry_collection;
 }
 
-fn attach_geometry_to_nodes_for_way(
-    way: &mut Way,
-    nodes: &HashMap<u64, Node>,
-){
+fn add_linestring_to_polygons(
+    mut linestring: LineString,
+    polygons: &mut Vec<IncompletePolygon>,
+    is_outer: bool,
+) {
+    let push_new_polygon = |linestring: LineString, polygons: &mut Vec<IncompletePolygon>| {
+        polygons.push(IncompletePolygon {
+            exterior: linestring,
+            interior: Vec::new(),
+        });
+    };
+
+    if polygons.is_empty() {
+        if !is_outer {
+            panic!(
+                "No polygon exists to hold the inner linestring boundary!\n linestring: {:?}",
+                linestring
+            );
+        }
+
+        push_new_polygon(linestring, polygons);
+
+        return;
+    }
+
+    //  Cases
+    //  Previous polygon in polygons has no inners
+    //      If is_outer: check to see if the first coord of linestring is the last coord of the previous outer linestring, if so, merge them
+    //                      If not, create a new polygon
+    //      Else !is_outer: Append linestring to previous polygon inners
+    //  Else prev has inners:
+    //      If is outer: create a new polygon
+    //      Else: check to see if the first coord of linestring is the last coord of the previous inner linestring, if so merge them.
+    //              If not, append to the vector of interior linestrings
+
+    let last_polygon = polygons.last_mut().unwrap();
+    let last_polygon_last_exterior_coord = last_polygon
+        .exterior
+        .0
+        .last()
+        .expect("A polygon should have at least one coordinate on outer linestring");
+    let linestring_first_coord = linestring
+        .0
+        .first()
+        .expect("The provided linestring should have at least two coordinates");
+
+    if is_outer && last_polygon.interior.is_empty() {
+        if last_polygon_last_exterior_coord.eq(linestring_first_coord) {
+            //Last coord of exterior linestring == first coord of new linestring. Merge
+            last_polygon.exterior.0.pop();
+            last_polygon.exterior.0.append(&mut linestring.0);
+        } else {
+            // New outer linestring, create new polygon.
+            push_new_polygon(linestring, polygons);
+        }
+    } else if is_outer && !last_polygon.interior.is_empty() {
+        //linestring is_outer and there exists inner linestrings on previous polygon
+        push_new_polygon(linestring, polygons);
+    } else {
+        //linestring is inner
+        attach_linestring_to_interior_of_polygon(linestring, &mut last_polygon.interior);
+    }
+}
+
+fn attach_linestring_to_interior_of_polygon(
+    mut linestring: LineString,
+    interior: &mut Vec<LineString>,
+) {
+    let err_msg = "A linestring should have at least two coordinates";
+    let linestring_first_coord = linestring.0.first().expect(&err_msg);
+
+    if let Some(last_interior_linestring) = interior.last_mut() {
+        let last_interior_linestring_last_coord =
+            last_interior_linestring.0.last().expect(&err_msg);
+        if last_interior_linestring_last_coord.eq(linestring_first_coord) {
+            last_interior_linestring.0.pop();
+            last_interior_linestring.0.append(&mut linestring.0);
+            return;
+        }
+    }
+
+    interior.push(linestring);
+}
+
+fn attach_geometry_to_nodes_for_way(way: &mut Way, nodes: &HashMap<u64, Node>) {
     if way.geometry.is_some() {
         return; //geometry already attached
     }
@@ -337,12 +485,12 @@ fn attach_geometry_to_nodes_for_way(
 
         way.geometry = Some(geometry);
     } else {
-        panic!("No nodes nor geometry exist for combined way object! \n {:#?}",
-            way);
+        panic!(
+            "No nodes nor geometry exist for combined way object! \n {:#?}",
+            way
+        );
     }
 }
-
-fn convert_ways_to_multi_geometry(ways: Vec<Way>) {}
 
 #[cfg(test)]
 mod tests {
@@ -357,7 +505,132 @@ mod tests {
         )
         .expect("Should have been able to read the file");
 
-        convert_osmjson_to_geojson(&contents);
+        convert_osmjson_to_geo(&contents);
         assert!(true);
     }
+
+    #[test]
+    fn test_add_linestring_to_polygons_handles_multiple_differing_outer_linestrings() {
+        let linestring_one: LineString = vec![(0., 0.), (10., 0.)].into();
+
+        let linestring_two: LineString = vec![(11., 0.), (20., 0.)].into();
+
+        let mut polygons: Vec<IncompletePolygon> = vec![];
+        let correct_polygons: Vec<IncompletePolygon> = vec![
+            IncompletePolygon {
+                exterior: linestring_one.clone(),
+                interior: vec![],
+            },
+            IncompletePolygon {
+                exterior: linestring_two.clone(),
+                interior: vec![],
+            },
+        ];
+
+        add_linestring_to_polygons(linestring_one, &mut polygons, true);
+        add_linestring_to_polygons(linestring_two, &mut polygons, true);
+
+        assert_eq!(polygons, correct_polygons);
+    }
+
+    #[test]
+    fn test_add_linestring_to_polygons_handles_multiple_chained_outer_linestrings() {
+        let linestring_one: LineString = vec![(0., 0.), (10., 0.)].into();
+
+        let linestring_two: LineString = vec![(10., 0.), (20., 0.)].into();
+
+        let combined_linestring: LineString = vec![(0., 0.), (10., 0.), (20., 0.)].into();
+
+        let mut polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_one,
+            interior: vec![],
+        }];
+        let correct_polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: combined_linestring,
+            interior: vec![],
+        }];
+
+        add_linestring_to_polygons(linestring_two, &mut polygons, true);
+
+        assert_eq!(polygons, correct_polygons);
+    }
+
+    #[test]
+    fn test_add_linestring_to_polygons_handles_creating_new_polygon_when_previous_polygon_has_inners_with_is_outer_flag(
+    ) {
+        let linestring_one: LineString = vec![(0., 0.), (10., 0.)].into();
+
+        let linestring_two: LineString = vec![(10., 0.), (20., 0.)].into();
+
+        let mut polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_one.clone(),
+            interior: vec![linestring_one.clone()],
+        }];
+
+        let correct_polygons: Vec<IncompletePolygon> = vec![
+            IncompletePolygon {
+                exterior: linestring_one.clone(),
+                interior: vec![linestring_one],
+            },
+            IncompletePolygon {
+                exterior: linestring_two.clone(),
+                interior: vec![],
+            },
+        ];
+
+        add_linestring_to_polygons(linestring_two, &mut polygons, true);
+
+        assert_eq!(polygons, correct_polygons);
+    }
+
+    #[test]
+    fn test_add_linestring_to_polygons_handles_adding_to_interior_when_previous_polygon_has_mismatched_last_inner(
+    ) {
+        let linestring_outer: LineString = vec![(0., 0.), (5., 0.)].into();
+        let linestring_inner_one: LineString = vec![(0., 0.), (10., 0.)].into();
+
+        let linestring_inner_two: LineString = vec![(11., 0.), (20., 0.)].into();
+
+        let mut polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_outer.clone(),
+            interior: vec![linestring_inner_one.clone()],
+        }];
+
+        let correct_polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_outer.clone(),
+            interior: vec![linestring_inner_one.clone(), linestring_inner_two.clone()],
+        }];
+
+        add_linestring_to_polygons(linestring_inner_two, &mut polygons, false);
+
+        assert_eq!(polygons, correct_polygons);
+    }
+
+    #[test]
+    fn test_add_linestring_to_polygons_handles_appending_interior_when_previous_polygon_has_mismatched_last_inner(
+    ) {
+        let linestring_outer: LineString = vec![(0., 0.), (5., 0.)].into();
+
+        let linestring_inner_one: LineString = vec![(0., 0.), (10., 0.)].into();
+
+        let linestring_inner_two: LineString = vec![(10., 0.), (20., 0.)].into();
+
+        let combined_inner_linestring: LineString = vec![(0., 0.), (10., 0.), (20., 0.)].into();
+
+        let mut polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_outer.clone(),
+            interior: vec![linestring_inner_one.clone()],
+        }];
+
+        let correct_polygons: Vec<IncompletePolygon> = vec![IncompletePolygon {
+            exterior: linestring_outer.clone(),
+            interior: vec![combined_inner_linestring],
+        }];
+
+        add_linestring_to_polygons(linestring_inner_two, &mut polygons, false);
+
+        assert_eq!(polygons, correct_polygons);
+    }
+
+    
 }
