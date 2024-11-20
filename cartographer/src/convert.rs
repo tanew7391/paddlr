@@ -18,7 +18,7 @@ struct OSMResponse {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 enum Element {
     node(Node),
     way(Way),
@@ -27,7 +27,6 @@ enum Element {
 
 #[derive(Deserialize, Debug, Clone)]
 struct Node {
-    r#type: String,
     id: u64,
     lat: f64,
     lon: f64,
@@ -45,7 +44,6 @@ impl From<Node> for geo_types::Point {
 
 #[derive(Deserialize, Debug, Clone)]
 struct Way {
-    r#type: String,
     id: u64,
     bounds: Option<Bounds>,
     nodes: Option<Vec<u64>>,
@@ -55,7 +53,6 @@ struct Way {
 
 #[derive(Deserialize, Debug)]
 struct Relation {
-    r#type: String,
     id: u64,
     bounds: Option<Bounds>,
     members: Vec<Member>,
@@ -69,7 +66,7 @@ enum MemberTypes {
 }
 
 #[derive(Deserialize, Debug)]
-#[serde(untagged)]
+#[serde(tag = "type")]
 enum Member {
     way(WayMember),
     node(NodeMember),
@@ -77,7 +74,6 @@ enum Member {
 
 #[derive(Deserialize, Debug)]
 struct WayMember {
-    r#type: String,
     r#ref: u64,
     role: String,
     geometry: Option<Vec<Coord>>,
@@ -85,7 +81,6 @@ struct WayMember {
 
 #[derive(Deserialize, Debug)]
 struct NodeMember {
-    r#type: String,
     r#ref: u64,
     role: String,
     lat: f64,
@@ -131,7 +126,6 @@ fn convert_node_member_to_node(node_member: NodeMember) -> Node {
     let mut tags: HashMap<String, String> = HashMap::new();
     tags.insert("role".to_string(), node_member.role);
     return Node {
-        r#type: node_member.r#type,
         id: node_member.r#ref,
         lat: node_member.lat,
         lon: node_member.lon,
@@ -141,7 +135,6 @@ fn convert_node_member_to_node(node_member: NodeMember) -> Node {
 
 fn convert_way_member_to_way(way_member: WayMember) -> Way {
     return Way {
-        r#type: way_member.r#type,
         id: way_member.r#ref,
         bounds: None,
         nodes: None,
@@ -205,29 +198,6 @@ fn extract_nodes_ways_relations_from_elements(
             }
         } else if let Element::relation(relation_instance) = element {
             relations.insert(relation_instance.id, relation_instance);
-            /*             let mut relation_member_type: Option<MemberTypes> = None;
-            let mut member_type_has_changed = false;
-            for member in relation_instance.members {
-
-                //Todo: store this logic in an impl
-                let current_member_type = match member {
-                    Member::way(..) => MemberTypes::Way,
-                    Member::node(..) => MemberTypes::Node,
-                };
-
-                if let Some(member_type) = relation_member_type {
-                    if member_type != current_member_type {
-                        //This is necessary to tell if nodes and ways are both present in the relationship.
-                        //In which case we will store both in regular node and way hashmaps
-                        member_type_has_changed = true;
-                    }
-                } else {
-                    relation_member_type = Some(current_member_type);
-                }
-
-
-
-            } */
         }
     }
 
@@ -236,7 +206,6 @@ fn extract_nodes_ways_relations_from_elements(
 
 pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
     let jd = &mut serde_json::Deserializer::from_str(input_json_string);
-    println!("Json string: {:#?}", input_json_string);
 
     let result: Result<OSMResponse, _> = serde_path_to_error::deserialize(jd);
     //todo: refactor
@@ -249,6 +218,8 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
         }
     };
 
+    println!("result: {:#?}", response);
+
     let (mut ways, mut nodes, relations) =
         extract_nodes_ways_relations_from_elements(response.elements);
 
@@ -256,6 +227,7 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
     let mut borrowed_nodes: HashSet<u64> = HashSet::new();
     let mut geometry_collection: GeometryCollection<f64> = GeometryCollection::default();
     for (relation_id, relation) in relations {
+        println!("Relation found, id: {:}", relation_id);
         //let mut relation_member_nodes: HashMap<u64, Node> = HashMap::new();
         //let mut relation_ways: HashMap<u32, Way> = HashMap::new();
         let mut referenced_relation_ways: HashMap<u32, u64> = HashMap::new();
@@ -263,6 +235,8 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
         let mut incomplete_polygons: Vec<IncompletePolygon> = vec![];
         let mut points: Vec<Point> = vec![];
         let mut index = 0;
+        let mut encountered_nodes = false;
+        let mut encountered_ways = false;
 
         if relation.members.len() == 0 {
             eprintln!("Relation {:} has no members!", relation_id);
@@ -274,10 +248,12 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
                 let node_instance = convert_node_member_to_node(node_member_instance);
                 points.push(Point::from(node_instance.clone()));
                 borrowed_nodes.insert(node_instance.id);
+                encountered_nodes = true;
 
                 //TODO: do we need this map?
                 //relation_member_nodes.insert(node_instance.id, node_instance);
             } else if let Member::way(way_member_instance) = member {
+                encountered_ways = true;
                 let way_ref = way_member_instance.r#ref;
 
                 let is_outer = way_member_instance.role.eq("outer");
@@ -308,10 +284,10 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
                     linestrings.push(geo_linestring);
                 }
             }
-            index += 1;
+            //index += 1;
         }
 
-        if borrowed_nodes.is_empty() {
+        if !encountered_nodes {
             //Only Ways in relation
 
             //https://wiki.openstreetmap.org/wiki/Relation:multipolygon#Two_disjunct_outer_rings
@@ -329,7 +305,8 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
                 .0
                 .push(geo::Geometry::MultiPolygon(multi_polygon));
 
-        } else if borrowed_ways.is_empty() {
+        } else if !encountered_ways {
+            //Only nodes in relation
 
             geometry_collection
                 .0
@@ -339,14 +316,19 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
             //Both nodes and ways in relation
             //Dissolve relationship and add all nodes and ways to the main node and way hashmaps (geojson has no feature for this relationship)
             //ways.insert(1, relation_ways.remove(0));
+            
+            println!("Relation: {:}, has both nodes and ways", relation_id);
+
             for incomplete_polygon in incomplete_polygons {
                 geometry_collection.0.push(geo::Geometry::Polygon(incomplete_polygon.into()));
+                println!("Adding polygon");
             }
 
             for linestring in linestrings {
                 geometry_collection.0.push(
                     geo::Geometry::LineString(linestring)
-                )
+                );
+                println!("Adding linestring");
             }
 
             for point in points {
@@ -362,6 +344,7 @@ pub fn convert_osmjson_to_geo(input_json_string: &str) -> GeometryCollection {
     }
 
     for (_way_id, way) in ways.iter_mut() {
+        println!("Standalone way found, id: {:}", _way_id);
         //ensure all geometry is attached to ways before deleting nodes
         attach_geometry_to_nodes_for_way(way, &nodes);
     }
@@ -496,16 +479,20 @@ fn attach_geometry_to_nodes_for_way(way: &mut Way, nodes: &HashMap<u64, Node>) {
 mod tests {
     use std::fs;
 
+    use geojson::Value;
+
     use super::*;
 
     #[test]
     fn exploration() {
         let contents = fs::read_to_string(
-            "/home/tanew/Documents/Projects/Rust/Paddlr/cartographer/src/test.json",
+            "/home/tanew/Documents/Projects/Rust/Paddlr/test_files/no_turn_restriction.osm.json",
         )
         .expect("Should have been able to read the file");
 
-        convert_osmjson_to_geo(&contents);
+        let geo = convert_osmjson_to_geo(&contents);
+        let geojson = Value::from(&geo);
+        println!("\n\n\n{:#?}", geojson.to_string());
         assert!(true);
     }
 
@@ -632,5 +619,4 @@ mod tests {
         assert_eq!(polygons, correct_polygons);
     }
 
-    
 }

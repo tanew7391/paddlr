@@ -1,3 +1,5 @@
 *.drawio
 *_hidden.*
 .vscode/
+test_files/*
+*output.txt
