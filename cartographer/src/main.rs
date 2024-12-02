@@ -4,39 +4,25 @@ extern crate rocket;
 mod convert;
 
 use convert::convert_osmjson_to_geo;
-use geo::{BoundingRect, Contains, Polygon};
-use serde::Deserialize;
-use serde_json::Map;
-use std::{collections::HashMap, error::Error};
+use geo::{BoundingRect, Contains, Geometry as GeoGeometry, PreparedGeometry, Relate};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+};
+
+use log::{info, warn, debug, self};
+use std::fs;
 
 use geo_types::{GeometryCollection, Point};
 
-
-use geojson::{
-    feature::Id::Number, quick_collection, Bbox, Feature, FeatureCollection, GeoJson, Geometry,
-    PointType, Value,
-};
+use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
 use rocket::data::{Data, ToByteUnit};
 
 const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 
-#[derive(Deserialize)]
-struct OSMResponse {
-    version: Option<f32>,
-    generator: Option<String>,
-    osm3s: Option<HashMap<String, String>>,
-    elements: Vec<Element>,
-}
-
-#[derive(Deserialize)]
-struct Element {
-    r#type: Option<String>,
-    id: Option<u32>,
-    tags: Option<Map<String, serde_json::Value>>,
-    geometry: Geometry,
-}
-
-async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeometryCollection, Box<dyn Error>> {
+async fn get_associated_water_features(
+    bounding_area: Bbox,
+) -> Result<GeometryCollection, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_box_as_string = bounding_area
@@ -57,8 +43,6 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeometryCo
         bounding_box_as_string, bounding_box_as_string
     );
 
-    println!("Query: \n{query}");
-
     let res = client
         .post(OVERPASS_API_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -68,7 +52,11 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<GeometryCo
         .text()
         .await?;
 
+    debug!("{:#?}", res);
+
     let geometry_collection = convert_osmjson_to_geo(&res);
+
+    debug!("{:#?}", geometry_collection);
 
     Ok(geometry_collection)
 }
@@ -140,49 +128,175 @@ fn multipoint_to_linestring(geojson: GeoJson) -> Result<GeoJson, Box<dyn Error>>
     Err("Input is not a valid MultiPoint geometry".into())
 }
 
-
-
 fn find_containing_polygon<'a>(
     point: &Point<f64>,
     geometries: &'a GeometryCollection<f64>,
-) -> Option<&'a geo_types::Polygon> {
+) -> Option<geo_types::Geometry> {
     // Iterate over each geometry in the collection
-    println!("Searching for location: {:?}", point);
-    println!("Geometry: {:#?}", geometries);
+    //println!("Searching for location: {:?}", point);
+    //println!("Geometry: {:#?}", geometries);
 
     for geometry in geometries {
         //println!("Geometry: {:#?}", geometry);
         //Start debug
 
-
-
-        if let geo::Geometry::Polygon(polygon) = geometry {
-            println!("Within polygon: {:?}", polygon);
-            if let Some(bbox) = geometry.bounding_rect() {
-                println!("Bounding box {:?} :", bbox);
-                if bbox.contains(point) {
-                    println!(
-                        "Bounding box {:?} contains point!, Point is: {:?}",
-                        bbox, point
-                    );
-                    // Perform the more precise contains check
-                    println!("This is for geometry: {:?}", polygon);
-                    if polygon.contains(point) {
-                        println!("Geometry {:?} contains point!", polygon);
-                        return Some(&polygon); // Return the first containing polygon
-                    }
+        if let Some(bbox) = geometry.bounding_rect() {
+            debug!("Bounding box {:?} :", bbox);
+            if bbox.contains(point) {
+                println!(
+                    "Bounding box {:?} contains point!, Point is: {:?}",
+                    bbox, point
+                );
+                // Perform the more precise contains check
+                //println!("This is for geometry: {:?}", geometry);
+                if geometry.contains(point) {
+                    //println!("Geometry {:?} contains point!", geometry);
+                    
+                    return Some(geometry.clone()); // Return the first containing polygon
                 }
             }
         }
-
     }
+    warn!("Could not find bounding polygon");
+    warn!("Point: {:?}", point);
     None // No containing polygon found
+}
+
+fn proof_of_concept_find_adjacent_geometries(
+    geom_subject: &PreparedGeometry,
+    geom_search_set: &HashMap<u32, PreparedGeometry>,
+    adjacent_geom_set: &mut HashSet<u32>,
+) {
+    //TODO: add bounding box check
+    /* //println!("Looking for Polygon Neighbours ;)");
+    if let Err(error) = io::stdout().flush() {
+        println!("{}", error);
+    } */
+    println!("Size of list: {:}", adjacent_geom_set.len());
+    for (&id, polygon_search) in geom_search_set.iter() {
+        if adjacent_geom_set.contains(&id) {
+            continue;
+        }
+        let de9im_matrix: geo::relate::IntersectionMatrix = geom_subject.relate(polygon_search);
+        println!("Not equal");
+        if de9im_matrix.is_touches() || de9im_matrix.is_overlaps() {
+            adjacent_geom_set.insert(id);
+            proof_of_concept_find_adjacent_geometries(
+                polygon_search,
+                geom_search_set,
+                adjacent_geom_set,
+            );
+        }
+    }
+}
+
+fn test<'a>(
+    start_polygon: &'a GeoGeometry,
+    geom_search_set: Vec<&'a GeoGeometry>,
+) -> Vec<&'a GeoGeometry> {
+    //goal -  return a collection of polygons that represent a graph of the shortest path
+    //https://stackoverflow.com/questions/57476033/algorithm-to-trim-a-graph
+
+    //Take starting polygon out of the search set - assign ID of 0
+    //Associate ID with each polygon starting from 1
+    //Send search set to algorithm
+    //Construct Vector of polygons from returned hashset of IDs
+
+    let mut tagged_polygons: HashMap<u32, &GeoGeometry> = HashMap::new();
+    let mut tagged_prepared_polygons: HashMap<u32, PreparedGeometry> = HashMap::new();
+
+    //Insert the id 0, as this is the id of the geom_subject which will always be in the adjacent geom set
+    let mut adjacent_geom_set: HashSet<u32> = HashSet::from([0]);
+
+    tagged_polygons.insert(0, start_polygon);
+    tagged_prepared_polygons.insert(0, PreparedGeometry::from(start_polygon));
+
+    let mut index: u32 = 1;
+
+    for polygon_to_search in geom_search_set {
+        if polygon_to_search.eq(start_polygon) {
+            continue;
+        }
+
+        tagged_polygons.insert(index, polygon_to_search);
+        tagged_prepared_polygons.insert(index, PreparedGeometry::from(polygon_to_search));
+        index += 1;
+    }
+
+    let geom_subject_prepared_polygon = tagged_prepared_polygons.get(&0).unwrap();
+    proof_of_concept_find_adjacent_geometries(
+        geom_subject_prepared_polygon,
+        &tagged_prepared_polygons,
+        &mut adjacent_geom_set,
+    );
+
+    let set: Vec<&'a GeoGeometry> = tagged_polygons
+        .iter()
+        .filter(|(&k, _)| adjacent_geom_set.contains(&k))
+        .map(|(_, &v)| v)
+        .collect();
+
+    set
+}
+
+#[post("/api_test", data = "<data>")]
+async fn test_index(data: Data<'_>) -> String {
+    let data_string = data.open(1.megabytes()).into_string().await.unwrap();
+
+    let json = data_string.parse::<GeoJson>().unwrap();
+
+    let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
+
+    let bounding_box: Bbox =
+        extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
+
+    let associated_water_features_string = fs::read_to_string(
+        "/home/tanew/Documents/Projects/Rust/Paddlr/test_files/square_lake.geojson",
+    )
+    .expect("Should have been able to read the file");
+
+
+    let associated_water_features = associated_water_features_string.parse::<GeoJson>().unwrap();
+    let mut collection: GeometryCollection<f64> = geojson::quick_collection(&associated_water_features).unwrap();
+
+
+
+    let defined_point = Point::new(
+        contained_multipoint_geometry[0][0],
+        contained_multipoint_geometry[0][1],
+    );
+
+    //println!("After conv: {:#?}", collection);
+
+    let possible_containing_polygon =
+        find_containing_polygon(&defined_point, &collection);
+
+    let geometry_container_reference_holder = Vec::from_iter(collection.iter());
+    
+    //let geojson_of_associated_water_features = Value::from(&geo::Geometry::GeometryCollection(associated_water_features));
+    //println!("{:#?}", geojson_of_associated_water_features);
+    //return geojson_of_associated_water_features.to_string();
+   
+    let containing_polygon = match possible_containing_polygon {
+        Some(polygon) => polygon,
+        None => panic!("No containing polygon!!!")
+    };
+    
+    let set = test(&containing_polygon, geometry_container_reference_holder);
+
+    Value::from(&geo::Geometry::GeometryCollection(
+        GeometryCollection::new_from(Vec::from_iter(
+            set.into_iter().map(|geom| geom.to_owned()),
+        )),
+    ))
+    .to_string()
+
 }
 
 #[post("/api", data = "<data>")]
 async fn index(data: Data<'_>) -> String {
     let data_string = data.open(1.megabytes()).into_string().await.unwrap();
-    
+
     let json = data_string.parse::<GeoJson>().unwrap();
 
     let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
@@ -196,7 +310,6 @@ async fn index(data: Data<'_>) -> String {
     let associated_water_features = associated_water_features_future.await.unwrap();
     //println!("Water features: {:}", associated_water_features.to_string());
 
-
     let defined_point = Point::new(
         contained_multipoint_geometry[0][0],
         contained_multipoint_geometry[0][1],
@@ -204,16 +317,33 @@ async fn index(data: Data<'_>) -> String {
 
     //println!("After conv: {:#?}", collection);
 
+    let possible_containing_polygon =
+        find_containing_polygon(&defined_point, &associated_water_features);
 
-    let possible_containing_polygon = find_containing_polygon(&defined_point, &associated_water_features);
+    let geometry_container_reference_holder = Vec::from_iter(associated_water_features.iter());
+    
+    //let geojson_of_associated_water_features = Value::from(&geo::Geometry::GeometryCollection(associated_water_features));
+    //println!("{:#?}", geojson_of_associated_water_features);
+    //return geojson_of_associated_water_features.to_string();
+   
+    let containing_polygon = match possible_containing_polygon {
+        Some(polygon) => polygon,
+        None => panic!("No containing polygon!!!")
+    };
+    
+    let set = test(&containing_polygon, geometry_container_reference_holder);
 
-    match possible_containing_polygon {
-        Some(polygon) => Value::from(&geo::Geometry::Polygon(polygon.clone())).to_string(),
-        None => Value::from(&associated_water_features).to_string(),
-    }
+    Value::from(&geo::Geometry::GeometryCollection(
+        GeometryCollection::new_from(Vec::from_iter(
+            set.into_iter().map(|geom| geom.to_owned()),
+        )),
+    ))
+    .to_string()
+
+    
 }
 
 #[launch]
 fn rocket() -> _ {
-    rocket::build().mount("/", routes![index])
+    rocket::build().mount("/", routes![index, test_index])
 }

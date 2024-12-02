@@ -177,6 +177,7 @@ dependencies = [
  "geo",
  "geo-types",
  "geojson",
+ "log",
  "reqwest",
  "rocket",
  "serde",
