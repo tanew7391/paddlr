@@ -1,18 +1,30 @@
-CREATE EXTENSION postgis;
-CREATE EXTENSION pgrouting;
-CREATE EXTENSION postgis_sfcgal;
+--CREATE EXTENSION postgis;
+--CREATE EXTENSION pgrouting;
+--CREATE EXTENSION postgis_sfcgal;
 
 drop table if exists merged; 
 drop table if exists median_axis ;
 drop table if exists start_end_keys;
 drop table if exists median_axis_disjoint ;
+drop table if exists median_axis_disjoint_noded;
+drop table if exists median_axis_disjoint_noded_vertices_pgr;
+drop table if exists median_axis_not_conformed ;
 drop table if exists output;
 
---TODO: union only based on bounding box of points
-CREATE TABLE merged AS
+CREATE TABLE merged as
+ with pointa as (
+ 	select wkb_geometry from points where ogc_fid = 1
+ ),
+ pointb as (
+ 	select wkb_geometry from points where ogc_fid = 2
+ ),
+ --envelope to only union what is inside of the bounding box
+ envelope as (
+ 	select ST_MakeEnvelope(ST_X(pointb.wkb_geometry), ST_Y(pointb.wkb_geometry), ST_X(pointa.wkb_geometry), ST_Y(pointa.wkb_geometry)) as geom from pointa, pointb
+ )
  SELECT ST_Union(way) as tunion
- FROM planet_osm_polygon
- where "natural" = 'water'
+ FROM planet_osm_polygon, envelope
+ where "natural" = 'water' and (way && envelope.geom);
  
 create temp table focus_polygon as
 with polygons as (
@@ -25,20 +37,19 @@ pointw as (
 select polygon
 from polygons, pointw
 where st_within(pointw.wkb_geometry, polygons.polygon);
- 
+
+
 --Slow, restrict by bounding box
 create table median_axis as 
 select ST_ApproximateMedialAxis(
-				(st_dump(
-				(select * from focus_polygon)
-					)
-				).geom
-			) as geom
+				CG_ApproximateMedialAxis(
+				(select * from focus_polygon))
+			) as geom;
  
 -- Create a table of disjoint lines belonging to polygon that houses the start point (ogc_fid=2)
 --Very long query!!!
 create table median_axis_disjoint as
-select geom.geom
+select geom.geom as the_geom
 from st_dump(
 			(select geom
 			from median_axis)
@@ -68,7 +79,7 @@ insert into median_axis_disjoint (the_geom)
 		select ogc_fid, wkb_geometry from points where ogc_fid = 1
 	) as i
     INNER JOIN (
-        SELECT ST_Collect(st_approximatemedialaxis) AS geom
+        SELECT ST_Collect(geom) AS geom
              FROM median_axis
     ) as ma
     ON i.ogc_fid = 1)
@@ -80,12 +91,13 @@ insert into median_axis_disjoint (the_geom)
    
 with rows as  (
 insert into median_axis_disjoint (the_geom)
+	--Create a line from the selected end point to the closest point on the skeleton and insert into the skeleton
 	(SELECT ST_MakeLine(i.wkb_geometry, ST_ClosestPoint(ma.geom, i.wkb_geometry)) AS geom
     FROM (
 		select ogc_fid, wkb_geometry from points where ogc_fid = 2
 	) as i
     INNER JOIN (
-        SELECT ST_Collect(st_approximatemedialaxis) AS geom
+        SELECT ST_Collect(geom) AS geom
              FROM median_axis
     ) as ma
     ON i.ogc_fid = 2)
