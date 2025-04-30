@@ -42,8 +42,8 @@ where st_within(pointw.wkb_geometry, polygons.polygon);
 --Slow, restrict by bounding box
 create table median_axis as 
 select ST_ApproximateMedialAxis(
-				CG_ApproximateMedialAxis(
-				(select * from focus_polygon))
+				ST_SimplifyPreserveTopology(
+				(select * from focus_polygon), 30.0)
 			) as geom;
  
 -- Create a table of disjoint lines belonging to polygon that houses the start point (ogc_fid=2)
