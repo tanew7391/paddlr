@@ -1,13 +1,13 @@
 #[macro_use]
 extern crate rocket;
 
-use cdt;
 use geo_postgis::FromPostgis;
 use postgis::ewkb;
 use proj::{Proj, Transform};
 use tokio_postgres::NoTls;
 
-use geo::{BoundingRect, Contains, Geometry as GeoGeometry, PreparedGeometry, Relate};
+use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
+use geo::{BoundingRect, Contains, Coord, CoordNum, Geometry as GeoGeometry, PreparedGeometry, Relate};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -277,37 +277,41 @@ async fn test() -> String {
             None,
         ).expect("Failed to create transformer");
 
-    let mut exterior_ring_pts: Vec<(f64, f64)> = exterior_ring
+
+
+
+    let mut vertices: Vec<Point2<f64>> = exterior_ring
         .exterior()
         .points()
-        .map(|p| (p.x(), p.y()))
+        .map(|p| Point2::new(p.x(), p.y()))
         .collect();
 
-    let mut current_interior_index = exterior_ring_pts.len();
-    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut current_interior_index = vertices.len();
+    let mut edges: Vec<[usize; 2]> = Vec::new();
 
     for interior_ring in &interior_rings {
-        let points: Vec<(f64, f64)> = interior_ring
+        let points: Vec<Point2<f64>> = interior_ring
             .exterior()
             .points()
-            .map(|p| (p.x(), p.y()))
+            .map(|p| Point2::new(p.x(), p.y()))
             .collect();
-        let new_edge = (
-            current_interior_index,
-            current_interior_index + points.len() - 1,
-        );
-        edges.push(new_edge);
+
+        for i in 0..points.len() {
+            let new_edge: [usize; 2] = [
+                i,
+                (i+1) % points.len()
+            ];
+            edges.push(new_edge);
+        }
         current_interior_index += points.len();
-        println!("Interior ring indexes: {:?}", new_edge);
-        exterior_ring_pts.extend(points);
+
+        vertices.extend(points);
     }
 
     println!("Last interior ring edge: {:?}", edges.last());
 
-    let mut triangulation_is_complete = false;
-    let mut triangles: Result<cdt::Triangulation, cdt::Error> = Err(cdt::Error::EmptyInput);
 
-    while !triangulation_is_complete {
+    /* while !triangulation_is_complete {
         triangles = cdt::Triangulation::build_with_edges(&exterior_ring_pts, &edges);
         if let Err(cdt::Error::PointOnFixedEdge(index)) = triangles {
 
@@ -339,48 +343,25 @@ async fn test() -> String {
         } else {
             triangulation_is_complete = true;
         }
-    }
-
-/*     for edge in &edges {
-        assert!(
-            !(edge.0 >= exterior_ring_pts.len()),
-            "Interior ring index out of bounds: {} >= {} on edge 0",
-            edge.0,
-            exterior_ring_pts.len()
-        );
-        if edge.1 == exterior_ring_pts.len() {
-            let mut point = geo_types::Point::from(exterior_ring_pts[edge.1 - 1]);
-            point.transform(&transformer).unwrap();
-            println!(
-                "Exterior ring at edge.1 - 1: {:?}",
-                point
-            );
-        }
-        assert!(
-            !(edge.1 >= exterior_ring_pts.len()),
-            "Interior ring index out of bounds: {} >= {} on edge 1",
-            edge.1,
-            exterior_ring_pts.len()
-        );
-        assert!(
-            !(edge.0 == edge.1),
-            "Edges are identical: {} == {}",
-            edge.0,
-            edge.1
-        );
     } */
 
     //Debug mode
     let mut geometry_collection_vector: Vec<geo_types::Geometry> = vec![];
     for &edge in &edges {
-        if !(edge.0 >= 10637 && edge.1 <= 10637) {
+        println!("HERE Edge: {:?} {:?}", vertices[edge[0]], vertices[edge[1]]);
+        if edge[0] > edge[1] {
             continue;
         }
-        println!("HERE Edge: {:?} {:?}", exterior_ring_pts[edge.0], exterior_ring_pts[edge.1]);
-        let polygon = exterior_ring_pts[edge.0..edge.1].to_vec();
-        let polygon = geo_types::Polygon::new(geo_types::LineString::from(polygon), vec![]);
-        geometry_collection_vector.push(geo_types::Geometry::from(polygon));
+        let line_segment = vertices[edge[0]..edge[1]].to_vec();
+        let linestring = geo_types::LineString::from(line_segment.into_iter().map(|c| Coord{
+            x: c.x,
+            y: c.y,
+        }).collect::<Vec<Coord<f64>>>());
+        geometry_collection_vector.push(geo_types::Geometry::from(linestring));
     }
+
+    let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
+
 
     let mut geometry_collection =
         geo_types::GeometryCollection::new_from(geometry_collection_vector);
@@ -390,32 +371,15 @@ async fn test() -> String {
 
     //End debug mode
 
-    if let Err(e) = &triangles {
+ /*    if let Err(e) = &triangles {
         println!("Error creating triangulation: {:?}", e);
         println!("Error source: {:?}", e.source());
         //panic!("Error creating triangulation");
-    }
-
-    //triangles.unwrap().to_svg(true);
+    } */
 
     debug_string
 }
 
-fn remove_point_from_exterior_ring(
-    exterior_ring: &mut Vec<(f64, f64)>,
-    edges: &mut Vec<(usize, usize)>,
-    point: usize,
-) -> () {
-    exterior_ring.remove(point);
-    for edge in edges.iter_mut() {
-        if edge.0 > point {
-            edge.0 -= 1;
-        }
-        if edge.1 > point {
-            edge.1 -= 1;
-        }
-    }
-}
 /*  #[tokio::main]
 async fn main() {
     test().await;
