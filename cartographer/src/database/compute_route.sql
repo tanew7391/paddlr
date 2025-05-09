@@ -25,7 +25,7 @@ CREATE TABLE merged as
  SELECT ST_Union(way) as tunion
  FROM planet_osm_polygon, envelope
  where "natural" = 'water' and (way && envelope.geom);
- 
+
 create temp table focus_polygon as
 with polygons as (
 	select (st_dump(tunion)).geom as polygon
@@ -38,6 +38,15 @@ select polygon
 from polygons, pointw
 where st_within(pointw.wkb_geometry, polygons.polygon);
 
+--Get all interior rings (holes)
+--The geom field contains each ring as a POLYGON. The path field is an integer array of length 1 containing the polygon ring index. The exterior ring (shell) has index 0. The interior rings (holes) have indices of 1 and higher.
+create table holes as
+SELECT (ring).geom
+FROM (
+  SELECT ST_DumpRings(polygon) AS ring
+  FROM focus_polygon
+) AS sub
+WHERE (ring).path[1] > 0;
 
 --Slow, restrict by bounding box
 create table median_axis as 
@@ -155,3 +164,12 @@ SELECT seq, the_geom
     INNER JOIN median_axis_disjoint_noded x
         ON d.edge = x.id
 ;
+
+SELECT PostGIS_Extensions_Upgrade();
+select postgis_full_version(); 
+
+--https://postgis.net/docs/ST_SimplifyPolygonHull.html
+--https://www.cybertec-postgresql.com/en/postgis-upgrade-geos-with-ubuntu-in-3-steps/
+select ST_SimplifyPolygonHull(polygon, 0.8, FALSE)
+from focus_polygon;
+

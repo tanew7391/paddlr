@@ -1,0 +1,11 @@
+#Queries overpass and returns OSM xml that can be read by tools like ogr2ogr
+
+[out:xml];
+(
+way["natural"="water"](45.31565236573251,-79.13167396221884,46.164614496897094,-77.55538582325732)->.ways;
+relation["natural"="water"](45.31565236573251,-79.13167396221884,46.164614496897094,-77.55538582325732)->.relations;
+way(r.relations)->.relationways;
+node(w.ways);
+node(w.relationways);
+);
+out meta;

@@ -38,6 +38,7 @@ const Tester = () => {
             getRoute(
                 marker_array_to_multipoint_geojson(waypoints)
             ).then((info) => {
+                console.log("Setting route");
                 setRoute(info.data);
             }).catch((err) => {
                 console.error(err);

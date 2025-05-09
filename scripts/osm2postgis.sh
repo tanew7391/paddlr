@@ -1,0 +1,1 @@
+osm2pgsql -d gisdb -U postgres -H localhost -W --style $1 $2
