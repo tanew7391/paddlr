@@ -8,11 +8,9 @@ use postgis::ewkb;
 use postgres::{tls::NoTlsStream, Socket};
 use proj::{Proj, Transform};
 use tokio_postgres::{Client, NoTls};
-use spade::PositionInTriangulation::{
-    OnFace,
-    OnEdge,
-    OnVertex
-};
+use spade::{internals::FixedHandleImpl, PositionInTriangulation::{
+    OnEdge, OnFace, OnVertex
+}};
 
 use geo::{
     Contains, Coord, Within
@@ -369,11 +367,17 @@ async fn index(data: Data<'_>) -> String {
 
 
 
-    let transformer = Proj::new_known_crs(
+    let transform_to_wgs84 = Proj::new_known_crs(
         "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
              "+proj=longlat +datum=WGS84 +no_defs +type=crs",
             None,
         ).expect("Failed to create transformer");
+
+    let transform_to_pseudo_mercator = Proj::new_known_crs(
+        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+        None,
+    ).expect("Failed to create transformer");
 
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 
@@ -428,7 +432,7 @@ async fn index(data: Data<'_>) -> String {
     let mut geometry_collection =
         geo_types::GeometryCollection::new_from(geometry_collection_vector);
     geometry_collection
-        .transform(&transformer)
+        .transform(&transform_to_wgs84)
         .expect("Failed to reproject geometry collection");
 
     let debug_string = Value::from(&geometry_collection).to_string();
@@ -444,15 +448,24 @@ async fn index(data: Data<'_>) -> String {
 
 
     //Temp
-    let start = Point2::new(
-        contained_multipoint_geometry[0][0],
-        contained_multipoint_geometry[0][1],
-    );
-    let end = Point2::new(
-        contained_multipoint_geometry[1][0],
-        contained_multipoint_geometry[1][1],
-    );
+    let mut start = Coord{
+        x: contained_multipoint_geometry[0][0],
+        y: contained_multipoint_geometry[0][1],
+    };
+    let mut end = Coord{
+        x: contained_multipoint_geometry[1][0],
+        y: contained_multipoint_geometry[1][1],
+    };
+    
+    start.transform(&transform_to_pseudo_mercator).unwrap();
+    end.transform(&transform_to_pseudo_mercator).unwrap();
+
+    let start = Point2::new(start.x, start.y);
+    let end = Point2::new(end.x, end.y);
+
     //End Temp
+    
+
 
     compute_A_star_pathfinding_from_delaney(
         start,
@@ -463,6 +476,23 @@ async fn index(data: Data<'_>) -> String {
 
     debug_string
 }
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct FaceNode(FaceHandle<InnerTag, Triangulation::Vertex, Triangulation::DirectedEdge, Triangulation::UndirectedEdge, Triangulation::Face>);
+
+impl FaceNode {
+    fn distance(&self, other: &Pos) -> u32 {
+      (self.0.abs_diff(other.0) + self.1.abs_diff(other.1)) as u32
+    }
+
+  
+    fn successors(&self) -> Vec<(Pos, u32)> {
+      let &Pos(x, y) = self;
+      vec![Pos(x+1,y+2), Pos(x+1,y-2), Pos(x-1,y+2), Pos(x-1,y-2),
+           Pos(x+2,y+1), Pos(x+2,y-1), Pos(x-2,y+1), Pos(x-2,y-1)]
+           .into_iter().map(|p| (p, 1)).collect()
+    }
+  }
 
 fn compute_A_star_pathfinding_from_delaney(
     start: Point2<f64>,
@@ -478,13 +508,24 @@ fn compute_A_star_pathfinding_from_delaney(
     let mut processed_face_indices: HashMap<usize, Point2<f64>> = HashMap::new();
     let mut start_face_index: Option<usize> = None;
     let mut end_face_index: Option<usize> = None;
-    let start_transformed = start.transform(&transformer).unwrap();
+    //let start_transformed = start.transform(&transformer).unwrap();
+    println!("Start transformed: {:?}", start);
     let position_in_triangulation = cdt.locate(start);
+    //Todo: test if a start or end point is on a vertex or an edge
+    let start_face_handle: Option<FixedFaceHandle<InnerTag>> = None; 
     if let OnFace(face_handle) = position_in_triangulation {
         println!("On face: {:?}", face_handle.index());
+        let start_face_handle = Some(face_handle);
     } else {
         println!("Not on face, {:?}", position_in_triangulation);
+        panic!("Start point is not on a face, no way to handle this yet");
     }
+
+
+    let start_face_center_vertex = cdt.face(start_face_handle.unwrap());
+
+
+    let a_star_results = astar(start_face_center_vertex.center(), successors, heuristic, success)
 
     //Uncomment when using for A star
     // First, loop through the faces of the CDT and test for intersection with the focus polygon
@@ -526,23 +567,6 @@ fn compute_A_star_pathfinding_from_delaney(
     let mut path = vec![start, end];
     path
 }
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct Pos(i32, i32);
-
-impl Pos {
-    fn distance(&self, other: &Pos) -> u32 {
-      (self.0.abs_diff(other.0) + self.1.abs_diff(other.1)) as u32
-    }
-
-  
-    fn successors(&self) -> Vec<(Pos, u32)> {
-      let &Pos(x, y) = self;
-      vec![Pos(x+1,y+2), Pos(x+1,y-2), Pos(x-1,y+2), Pos(x-1,y-2),
-           Pos(x+2,y+1), Pos(x+2,y-1), Pos(x-2,y+1), Pos(x-2,y-1)]
-           .into_iter().map(|p| (p, 1)).collect()
-    }
-  }
 
 //TODO: test
 fn cdt_face_to_polygon(
