@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+dotenv = "0.15.0"
 geo = "0.29.1"
 geo-postgis = "0.2.2"
 geo-types = "0.7.13"
