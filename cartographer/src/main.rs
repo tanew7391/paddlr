@@ -5,10 +5,9 @@ extern crate rocket;
 use pathfinding::prelude::astar;
 use geo_postgis::FromPostgis;
 use postgis::ewkb;
-use postgres::{tls::NoTlsStream, Socket};
 use proj::{Proj, Transform};
 use tokio_postgres::{Client, NoTls};
-use spade::{internals::FixedHandleImpl, PositionInTriangulation::{
+use spade::{PositionInTriangulation::{
     OnEdge, OnFace, OnVertex
 }};
 
@@ -23,9 +22,8 @@ use std::{
 };
 
 use log::{self, debug, info, warn};
-use std::fs;
 
-use geo_types::{GeometryCollection, Point};
+use geo_types::{GeometryCollection};
 
 use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
 use rocket::{
@@ -477,22 +475,83 @@ async fn index(data: Data<'_>) -> String {
     debug_string
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct FaceNode(FaceHandle<InnerTag, Triangulation::Vertex, Triangulation::DirectedEdge, Triangulation::UndirectedEdge, Triangulation::Face>);
 
-impl FaceNode {
-    fn distance(&self, other: &Pos) -> u32 {
-      (self.0.abs_diff(other.0) + self.1.abs_diff(other.1)) as u32
+//Start FaceNode
+#[derive(Clone, Debug)]
+struct FaceNode<'a>{
+    face: FaceHandle<'a, 
+        InnerTag, 
+        Point2<f64>, 
+        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::DirectedEdge,
+        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::UndirectedEdge,
+        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::Face
+    >,
+    focus_polygon: &'a geo_types::Polygon<f64>
+}
+
+impl PartialEq for FaceNode<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.face.eq(&other.face)
+    }
+}
+
+impl Eq for FaceNode<'_>{}
+
+impl std::hash::Hash for FaceNode<'_>{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        //TODO: test if this is the correct way to hash
+        self.face.hash(state);
+    }
+}
+
+impl Ord for FaceNode<'_>{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.face.cmp(&other.face)
+    }
+}
+
+impl PartialOrd for FaceNode<'_>{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.face.cmp(&other.face))
+    }
+}
+
+impl FaceNode<'_>{
+
+    //TODO: see if this is discarding SigFigs which could be important for pathfinding
+    fn distance(&self, other: &FaceNode) -> u32 {
+        self.face.center().distance_2(other.face.center()).sqrt().round() as u32
     }
 
   
-    fn successors(&self) -> Vec<(Pos, u32)> {
-      let &Pos(x, y) = self;
-      vec![Pos(x+1,y+2), Pos(x+1,y-2), Pos(x-1,y+2), Pos(x-1,y-2),
-           Pos(x+2,y+1), Pos(x+2,y-1), Pos(x-2,y+1), Pos(x-2,y-1)]
-           .into_iter().map(|p| (p, 1)).collect()
+    fn successors(&self) -> Vec<(FaceNode, u32)> {
+
+        let face_node = self.face;
+        let mut successor_faces: Vec<(FaceNode<'_>, u32)> = vec![];
+        for edge in face_node.adjacent_edges() {
+            let adjacent_face = edge.rev().face().as_inner();
+            let adjacent_face = match adjacent_face {
+                Some(face) => face,
+                None => {
+                    // Handle the case where the face is outer, we don't want to process it.
+                    continue;
+                }
+            };
+            let adjacent_face_node = FaceNode{
+                face: adjacent_face
+            };
+            let distance_between_faces = self.distance(&adjacent_face_node);
+            successor_faces.push((   
+                adjacent_face_node,
+                distance_between_faces
+            ))
+        }
+
+      successor_faces
     }
   }
+
+//End FaceNode
 
 fn compute_A_star_pathfinding_from_delaney(
     start: Point2<f64>,
