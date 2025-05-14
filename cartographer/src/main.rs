@@ -10,13 +10,13 @@ use spade::PositionInTriangulation::OnFace;
 use tokio_postgres::{Client, NoTls};
 use dotenv::dotenv;
 
-use geo::{Contains, Coord, Within};
+use geo::{Contains, Coord};
 use spade::{
-    handles::{self, FaceHandle, FixedFaceHandle, InnerTag},
+    handles::{FaceHandle, FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     error::Error,
     vec,
 };
@@ -252,10 +252,8 @@ async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon
         }
     };
 
-    let mut focus_polygon: Option<geo_types::Polygon<f64>> = None;
-
     let polygon: ewkb::Polygon = rows[0].get("polygon");
-    focus_polygon = Option::from_postgis(&polygon);
+    let focus_polygon = Option::from_postgis(&polygon);
 
     let focus_polygon = match focus_polygon {
         Some(polygon) => polygon,
@@ -283,10 +281,8 @@ async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
         }
     };
 
-    let mut exterior_ring: Option<geo_types::Polygon<f64>> = None;
-
     let polygon: ewkb::Polygon = rows[0].get("geom");
-    exterior_ring = Option::from_postgis(&polygon);
+    let exterior_ring = Option::from_postgis(&polygon);
 
     let exterior_ring = match exterior_ring {
         Some(ring) => ring,
@@ -402,29 +398,7 @@ async fn index(data: Data<'_>) -> String {
 
     //Debug mode
 
-    //TODO delete block
-    let mut geometry_collection_vector: Vec<geo_types::Geometry> = vec![];
-    for inner_face in cdt.inner_faces() {
-        let vertices = inner_face.positions();
-        let mut linestring = geo_types::LineString::from(
-            vertices
-                .into_iter()
-                .map(|c| Coord { x: c.x, y: c.y })
-                .collect::<Vec<Coord<f64>>>(),
-        );
-        let polygon = geo_types::Polygon::new(linestring, vec![]);
-        geometry_collection_vector.push(geo_types::Geometry::from(polygon));
-    }
-
     //let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
-
-    //TODO delete block
-    let mut geometry_collection =
-        geo_types::GeometryCollection::new_from(geometry_collection_vector);
-    geometry_collection
-        .transform(&transform_to_wgs84)
-        .expect("Failed to reproject geometry collection");
-
 
     println!(
         "Number of Undirected Edges: {:}",
@@ -480,8 +454,14 @@ struct FaceNode<'a> {
     >,
 }
 
+#[derive(PartialEq, Eq)]
+enum FaceNodeType {
+    Inner,
+    Outer,
+}
+
 impl<'a> FaceNode<'a> {
-    fn successors(&self, focus_polygon: &geo_types::Polygon<f64>) -> Vec<(FaceNode<'a>, u32)> {
+    fn successors(&self, focus_polygon: &geo_types::Polygon<f64>, checked_faces: &mut HashMap<usize, FaceNodeType>) -> Vec<(FaceNode<'a>, u32)> {
         let face_node = self.face;
         let mut successor_faces: Vec<(FaceNode<'a>, u32)> = vec![];
         for edge in face_node.adjacent_edges() {
@@ -489,7 +469,7 @@ impl<'a> FaceNode<'a> {
             let adjacent_face = match adjacent_face {
                 Some(face) => face,
                 None => {
-                    // Handle the case where the face is outer, we don't want to process it.
+                    // Handle the case where the adjacent face is outer (outer being outside of convex hull in CDT), we don't want to process it.
                     continue;
                 }
             };
@@ -500,11 +480,19 @@ impl<'a> FaceNode<'a> {
                 y: adjacent_center_point.y,
             };
 
-            if !focus_polygon.contains(&adjacent_center_point) {
-                //We need only process the faces that are inside the focus polygon
+            let adjacent_face_index = adjacent_face.index();
 
-                //TODO: if profiling shows this is a bottleneck, we can use a hashset to store the face indices
-                //exterior_face_indices.insert(face_index);
+            if !checked_faces.contains_key(&adjacent_face_index) {
+                //We need only process the faces that are inside the focus polygon
+                let face_node_type = match focus_polygon.contains(&adjacent_center_point) {
+                    true => FaceNodeType::Inner,
+                    false => FaceNodeType::Outer,
+                };
+                checked_faces.insert(adjacent_face_index, face_node_type);
+            } 
+            
+            if checked_faces[&adjacent_face_index] == FaceNodeType::Outer {
+                //We need only process the faces that are inside the focus polygon
                 continue;
             }
 
@@ -553,10 +541,7 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
     // Implement A* algorithm here using the CDT
     // This is a placeholder implementation
 
-    let mut exterior_face_indices: HashSet<usize> = HashSet::new();
-    let mut processed_face_indices: HashMap<usize, Point2<f64>> = HashMap::new();
-    let mut start_face_index: Option<usize> = None;
-    let mut end_face_index: Option<usize> = None;
+    let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
     //let start_transformed = start.transform(&transformer).unwrap();
     println!("Start transformed: {:?}", start);
     let position_in_triangulation = cdt.locate(start);
@@ -596,7 +581,7 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
     let heuristic_fn = |face_node: &FaceNode| face_node.distance(&end_face_node);
 
     let sucessors_fn = |face_node: &FaceNode<'a>| -> Vec<(FaceNode<'a>, u32)> {
-        face_node.successors(focus_polygon)
+        face_node.successors(focus_polygon, &mut processed_face_indices)
     };
 
     //TODO: this eq might not be correct if it refers to the actual handle and not the face.
