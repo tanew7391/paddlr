@@ -1,24 +1,31 @@
 #[macro_use]
 extern crate rocket;
+mod face_node;
 
+use dotenv::dotenv;
 use geo_postgis::FromPostgis;
+use pathfinding::prelude::astar;
 use postgis::ewkb;
 use proj::{Proj, Transform};
-use tokio_postgres::NoTls;
-
-use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
-use geo::{BoundingRect, Contains, Coord, CoordNum, Geometry as GeoGeometry, PreparedGeometry, Relate};
+use spade::PositionInTriangulation::OnFace;
 use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-    f64::consts::E,
-    vec,
+    env,
+    fs::File,
+    io::{Read, Write},
+    process::{Command, Stdio},
 };
+use tokio_postgres::{Client, NoTls};
+
+use geo::Coord;
+use spade::{
+    handles::{FixedFaceHandle, InnerTag},
+    ConstrainedDelaunayTriangulation, Point2, Triangulation,
+};
+use std::{collections::HashMap, error::Error, vec};
 
 use log::{self, debug, info, warn};
-use std::fs;
 
-use geo_types::{GeometryCollection, Point};
+use geo_types::GeometryCollection;
 
 use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
 use rocket::{
@@ -26,11 +33,14 @@ use rocket::{
     tokio,
 };
 
-const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
+pub use crate::face_node::FaceNode;
+use crate::face_node::FaceNodeType;
 
-async fn get_associated_water_features(
-    bounding_area: Bbox,
-) -> Result<GeometryCollection, Box<dyn Error>> {
+const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
+const PSEUDO_MERCATOR_CRS: &str = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs";
+const WGS_84_CRS: &str = "+proj=longlat +datum=WGS84 +no_defs +type=crs";
+
+async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_box_as_string = bounding_area
@@ -41,17 +51,18 @@ async fn get_associated_water_features(
 
     let query = format!(
         r#"
-        [out:json];
+        [out:xml];
         (
-        way["natural"="water"]({:});
-        relation["natural"="water"]({:});
+        way["natural"="water"]({:})->.ways;
+        relation["natural"="water"]({:})->.relations;
+        way(r.relations)->.relationways;
+        node(w.ways);
+        node(w.relationways);
         );
-        out geom;
+        out meta;
         "#,
         bounding_box_as_string, bounding_box_as_string
     );
-
-    println!("{:}", query);
 
     let res: String = client
         .post(OVERPASS_API_URL)
@@ -61,14 +72,8 @@ async fn get_associated_water_features(
         .await?
         .text()
         .await?;
-    debug!("{:#?}", res);
 
-    //let geometry_collection = convert_osmjson_to_geo(&res);
-
-    //Ok(geometry_collection)
-
-    //This is a temp value until I figure things out
-    Ok(GeometryCollection::default())
+    Ok(res)
 }
 
 fn extract_bounding_box_from_multipoint_geometry(
@@ -108,38 +113,28 @@ fn extract_multipoint_geometry(geojson: GeoJson) -> Result<Vec<PointType>, Box<d
     Err("GeoJSON does not include a multipoint geometry".into())
 }
 
-fn multipoint_to_linestring(geojson: GeoJson) -> Result<GeoJson, Box<dyn Error>> {
-    // Extract the MultiPoint geometry
-    if let GeoJson::Feature(feature) = geojson {
-        if let Some(Geometry {
-            value: Value::MultiPoint(multipoints),
-            ..
-        }) = feature.geometry
-        {
-            // Convert MultiPoint coordinates to LineString
-            let linestring_coords = multipoints;
+//Deprecated
+/*
+fn multipoint_to_linestring(multipoints: Vec<PointType>) -> GeoJson {
+    // Convert MultiPoint coordinates to LineString
+    let linestring_coords = multipoints;
 
-            // Create the LineString GeoJSON geometry
-            let linestring_geometry = Geometry::new(Value::LineString(linestring_coords));
+    // Create the LineString GeoJSON geometry
+    let linestring_geometry = Geometry::new(Value::LineString(linestring_coords));
 
-            // Create a new GeoJSON feature with the LineString geometry
-            let linestring_feature = geojson::Feature {
-                geometry: Some(linestring_geometry),
-                properties: feature.properties,
-                ..Default::default()
-            };
+    // Create a new GeoJSON feature with the LineString geometry
+    let linestring_feature = geojson::Feature {
+        geometry: Some(linestring_geometry),
+        properties: linestring_feature.properties,
+        ..Default::default()
+    };
 
-            // Wrap the feature in GeoJson and return it
-            return Ok(GeoJson::Feature(linestring_feature));
-        }
-    }
+    // Wrap the feature in GeoJson and return it
+    return GeoJson::Feature(linestring_feature);
+} */
 
-    // Return an error if input is not a valid MultiPoint GeoJSON
-    Err("Input is not a valid MultiPoint geometry".into())
-}
-
-#[post("/api", data = "<data>")]
-async fn index(data: Data<'_>) -> String {
+// Deprecated
+async fn index_old(data: Data<'_>) -> String {
     //let data_string = data.open(1.megabytes()).into_string().await.unwrap();
 
     //let json = data_string.parse::<GeoJson>().unwrap();
@@ -216,50 +211,112 @@ async fn index(data: Data<'_>) -> String {
     ))
     .to_string();
 
-    test().await
+    //test().await
+    "placeholder".to_string()
 }
 
-#[launch]
-fn rocket() -> _ {
-    rocket::build().mount("/", routes![index])
+async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
+    let sql_path = env::var("SQLPATH").unwrap_or("NO PASS SET".to_string());
+    let mut buf = String::new();
+    File::open(sql_path)?.read_to_string(&mut buf)?;
+    client.batch_execute(&buf).await?;
+
+    Ok(())
 }
 
-async fn test() -> String {
-    // Connect to the database.
-    let (client, connection) = tokio_postgres::connect(
-        "host=localhost port=5432 user=postgres password=postgres dbname=gisdb",
+async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>> {
+    let connection_attempt = tokio_postgres::connect(
+        &format!(
+            "host=localhost port=5432 user=postgres password={} dbname=gisdb",
+            env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string())
+        ),
         NoTls,
     )
-    .await
-    .unwrap();
+    .await;
+
+    let (client, connection) = match connection_attempt {
+        Ok(client_connection) => client_connection,
+        Err(e) => {
+            warn!("Error connecting to database: {:}", e);
+            return Err(e.into());
+        }
+    };
 
     // The connection object performs the actual communication with the database,
     // so spawn it off to run on its own.
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
+            warn!("Connection error: {:}", e);
         }
     });
 
+    Ok(client)
+}
+
+async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon, Box<dyn Error>> {
+    let rows = client.query("SELECT polygon FROM focus_polygon", &[]).await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Error retrieving rows: {:}", e);
+            return Err(e.into());
+        }
+    };
+
+    let polygon: ewkb::Polygon = rows[0].get("polygon");
+    let focus_polygon = Option::from_postgis(&polygon);
+
+    let focus_polygon = match focus_polygon {
+        Some(polygon) => polygon,
+        None => {
+            warn!("Could not find focus polygon! Rows[0]: {:?}", rows[0]);
+            return Err("No focus polygon found for study area!".into());
+        }
+    };
+
+    Ok(focus_polygon)
+}
+
+async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
+    client: &Client,
+) -> Result<(geo_types::Polygon, Vec<geo_types::Polygon<f64>>), Box<dyn Error>> {
     let rows = client
         .query("SELECT geom FROM holes WHERE path[1] = 0", &[])
-        .await
-        .unwrap();
-    let mut exterior_ring: Option<geo_types::Polygon<f64>> = None;
+        .await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Error retrieving rows: {:}", e);
+            return Err(e.into());
+        }
+    };
 
     let polygon: ewkb::Polygon = rows[0].get("geom");
-    exterior_ring = Option::from_postgis(&polygon);
+    let exterior_ring = Option::from_postgis(&polygon);
 
-    if exterior_ring.is_none() {
-        warn!("Could not find exterior ring! Rows[0]: {:?}", rows[0]);
-        panic!("No exterior ring found for study area!");
-    }
-    let exterior_ring = exterior_ring.unwrap();
+    let exterior_ring = match exterior_ring {
+        Some(ring) => ring,
+        None => {
+            warn!("Could not find exterior ring! Rows[0]: {:?}", rows[0]);
+            return Err("No exterior ring found for study area!".into());
+        }
+    };
 
+    //TODO: Condense this into a single query
     let rows = client
         .query("SELECT geom FROM holes WHERE path[1] > 1", &[])
-        .await
-        .unwrap();
+        .await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Error retrieving rows: {:}", e);
+            return Err(e.into());
+        }
+    };
+
     let mut interior_rings: Vec<geo_types::Polygon<f64>> = Vec::new();
     for row in &rows {
         let polygon: ewkb::Polygon = row.get("geom");
@@ -270,23 +327,128 @@ async fn test() -> String {
             warn!("Interior ring is None for row: {:?}", row);
         }
     }
+    Ok((exterior_ring, interior_rings))
+}
 
-    let transformer = Proj::new_known_crs(
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-             "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-            None,
-        ).expect("Failed to create transformer");
+fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
+    let host = env::var("PGHOST")?;
+    let database = env::var("PGDATABASE")?;
+    let user = env::var("PGUSER")?;
+    let password = env::var("PGPASSWORD")?;
+    let port = env::var("PGPORT")?;
 
+    let connection_string = format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        user, password, host, port, database
+    );
 
+    let mut command = Command::new("osm2pgsql")
+        .stdin(Stdio::piped())
+        //todo this may break, test
+        .stdout(Stdio::piped())
+        .arg("-d")
+        .arg(connection_string)
+        .arg("-r")
+        .arg("xml")
+        .arg("/dev/stdin")
+        .spawn()?;
 
+    let mut stdin = command.stdin.take().expect("Failed to open stdin");
+    std::thread::spawn(move || {
+        stdin
+            .write_all(osm_data.as_bytes())
+            .expect("Failed to write to stdin");
+    });
 
-    let mut vertices: Vec<Point2<f64>> = exterior_ring
+    let output = command.wait_with_output()?;
+    println!("Command output: {:?}", output);
+    Ok(())
+}
+
+async fn write_user_points_to_db(
+    client: &mut Client,
+    contained_multipoint_geometry: &Vec<PointType>,
+) -> Result<(), Box<dyn Error>> {
+    let mut transformed_multipoint_geometry: Vec<Coord> = vec![];
+
+    for point in contained_multipoint_geometry {
+        let mut coord = Coord {
+            x: point[0],
+            y: point[1],
+        };
+        coord
+            .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+            .expect("Failed to transform coordinate");
+        transformed_multipoint_geometry.push(coord);
+    }
+    let transaction = client.transaction().await?;
+
+    transaction.execute("DELETE FROM points", &[]).await?;
+
+    let prepared_statement = transaction
+        .prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))")
+        .await?;
+
+    for point in transformed_multipoint_geometry {
+        transaction
+            .execute(&prepared_statement, &[&point.x, &point.y])
+            .await?;
+    }
+    transaction.commit().await?;
+
+    Ok(())
+}
+
+#[post("/api", data = "<data>")]
+async fn index(data: Data<'_>) -> String {
+    let data_string = data.open(1.megabytes()).into_string().await.unwrap();
+
+    let json = data_string.parse::<GeoJson>().unwrap();
+
+    let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
+
+    let bounding_box: Bbox =
+        extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
+
+    let associated_water_features_future = get_associated_water_features(bounding_box);
+    //line_string_json.unwrap().to_string()
+    let associated_water_features = associated_water_features_future.await.unwrap();
+
+    write_osm_to_database(associated_water_features).expect("Failed to write OSM data to database");
+
+    let mut client = get_connected_client()
+        .await
+        .expect("Failed to connect to database");
+
+    write_user_points_to_db(&mut client, &contained_multipoint_geometry)
+        .await
+        .expect("Failed to write user points to database");
+
+    run_merging_script(&client)
+        .await
+        .expect("Failed to run merging script SQL");
+
+    let (exterior_ring, interior_rings) =
+        retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(&client)
+            .await
+            .expect("Failed to retrieve exterior and interior rings");
+
+    let focus_polygon = get_focus_polygon_from_db(&client)
+        .await
+        .expect("Failed to retrieve focus polygon");
+
+    let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
+
+    exterior_ring
         .exterior()
         .points()
         .map(|p| Point2::new(p.x(), p.y()))
-        .collect();
+        .for_each(|p| {
+            cdt.insert(p)
+                .expect(&format!("Unable to insert a vertex? {:?}", p));
+        });
 
-    let mut current_interior_index = vertices.len();
+    //let mut current_interior_index = vertices.len();
     let mut edges: Vec<[usize; 2]> = Vec::new();
 
     for interior_ring in &interior_rings {
@@ -297,87 +459,162 @@ async fn test() -> String {
             .collect();
 
         for i in 0..points.len() {
-            let new_edge: [usize; 2] = [
-                i,
-                (i+1) % points.len()
-            ];
-            edges.push(new_edge);
+            let new_edge: [Point2<f64>; 2] = [points[i], points[(i + 1) % points.len()]];
+            //edges.push(new_edge);
+            cdt.add_constraint_edge(new_edge[0], new_edge[1])
+                .expect(&format!("Unable to add constraint edge: {:?}", new_edge));
         }
-        current_interior_index += points.len();
-
-        vertices.extend(points);
     }
 
     println!("Last interior ring edge: {:?}", edges.last());
 
+    //let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
 
-    /* while !triangulation_is_complete {
-        triangles = cdt::Triangulation::build_with_edges(&exterior_ring_pts, &edges);
-        if let Err(cdt::Error::PointOnFixedEdge(index)) = triangles {
+    println!(
+        "Number of Undirected Edges: {:}",
+        cdt.num_undirected_edges()
+    );
+    println!("Number of Directed Edges: {:}", cdt.num_directed_edges());
+    println!("Number of Vertices: {:}", cdt.num_vertices());
+    println!("Number of Faces: {:}", cdt.num_all_faces());
+    println!("Number of Inner Faces: {:}", cdt.num_inner_faces());
 
+    //Temp
+    let mut start = Coord {
+        x: contained_multipoint_geometry[0][0],
+        y: contained_multipoint_geometry[0][1],
+    };
+    let mut end = Coord {
+        x: contained_multipoint_geometry[1][0],
+        y: contained_multipoint_geometry[1][1],
+    };
 
-            let prev_point = exterior_ring_pts[index - 1];
-            let point = exterior_ring_pts[index];
-            let next_point = exterior_ring_pts[index + 1];
-            let mut prev_point_transformed = geo_types::Point::from(prev_point);
-            let mut next_point_transformed = geo_types::Point::from(next_point);
-            let mut point_transformed = geo_types::Point::from(point);
-            prev_point_transformed.transform(&transformer).unwrap();
-            next_point_transformed.transform(&transformer).unwrap();
-            point_transformed.transform(&transformer).unwrap();
-            let line = geo_types::LineString::from(vec![
-                prev_point_transformed,
-                point_transformed,
-                next_point_transformed,
-            ]);
+    //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
+    let transform_to_wgs84 = Proj::new_known_crs(
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+                "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+            None,
+        ).expect("Failed to create transformer");
 
-            println!("Point is on fixed edge: {}\n Here is the line it belongs to: {:?}", index, 
-                Value::from(&line).to_string()
-            );
-            // Remove the point from the triangulation
-            remove_point_from_exterior_ring(
-                &mut exterior_ring_pts,
-                &mut edges,
-                index,
-            );
-        } else {
-            triangulation_is_complete = true;
-        }
-    } */
+    let transform_to_pseudo_mercator = Proj::new_known_crs(
+        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+        None,
+    ).expect("Failed to create transformer");
 
-    //Debug mode
-    let mut geometry_collection_vector: Vec<geo_types::Geometry> = vec![];
-    for &edge in &edges {
-        println!("HERE Edge: {:?} {:?}", vertices[edge[0]], vertices[edge[1]]);
-        if edge[0] > edge[1] {
-            continue;
-        }
-        let line_segment = vertices[edge[0]..edge[1]].to_vec();
-        let linestring = geo_types::LineString::from(line_segment.into_iter().map(|c| Coord{
-            x: c.x,
-            y: c.y,
-        }).collect::<Vec<Coord<f64>>>());
-        geometry_collection_vector.push(geo_types::Geometry::from(linestring));
-    }
+    start.transform(&transform_to_pseudo_mercator).unwrap();
+    end.transform(&transform_to_pseudo_mercator).unwrap();
 
-    let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
+    let start = Point2::new(start.x, start.y);
+    let end = Point2::new(end.x, end.y);
 
+    //End Temp
 
-    let mut geometry_collection =
-        geo_types::GeometryCollection::new_from(geometry_collection_vector);
-    geometry_collection.transform(&transformer).expect("Failed to reproject geometry collection");
+    let polygon_path = compute_A_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
 
-    let debug_string = Value::from(&geometry_collection).to_string();
-
-    //End debug mode
-
- /*    if let Err(e) = &triangles {
-        println!("Error creating triangulation: {:?}", e);
-        println!("Error source: {:?}", e.source());
-        //panic!("Error creating triangulation");
-    } */
+    let test: Vec<geo_types::Geometry<f64>> = polygon_path
+        .iter()
+        .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
+        .collect();
+    let mut test = geo_types::GeometryCollection::new_from(test);
+    test.transform(&transform_to_wgs84)
+        .expect("Failed to reproject geometry collection");
+    let debug_string = Value::from(&test).to_string();
 
     debug_string
+}
+
+fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
+    let face = face_node.get_face();
+    let vertices = face.positions();
+    let linestring = geo_types::LineString::from(
+        vertices
+            .into_iter()
+            .map(|c| Coord { x: c.x, y: c.y })
+            .collect::<Vec<Coord<f64>>>(),
+    );
+    geo_types::Polygon::new(linestring, vec![])
+}
+//End FaceNode
+
+fn compute_A_star_pathfinding_from_delaney<'a>(
+    start: Point2<f64>,
+    end: Point2<f64>,
+    cdt: &'a ConstrainedDelaunayTriangulation<Point2<f64>>,
+    focus_polygon: &geo_types::Polygon<f64>,
+) -> Vec<FaceNode<'a>> {
+    //This should return a vector of faces from cdt
+    // Implement A* algorithm here using the CDT
+    // This is a placeholder implementation
+
+    let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
+    //let start_transformed = start.transform(&transformer).unwrap();
+    println!("Start transformed: {:?}", start);
+    let position_in_triangulation = cdt.locate(start);
+
+    //Todo: test if a start or end point is on a vertex or an edge
+    let mut start_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
+    if let OnFace(face_handle) = position_in_triangulation {
+        println!("On face: {:?}", face_handle.index());
+        start_face_handle = Some(face_handle);
+    } else {
+        println!("Not on face, {:?}", position_in_triangulation);
+        panic!("Start point is not on a face, no way to handle this yet");
+    }
+
+    //Todo compress this into a single function
+    let position_in_triangulation = cdt.locate(end);
+    let mut end_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
+    if let OnFace(face_handle) = position_in_triangulation {
+        println!("On face: {:?}", face_handle.index());
+        end_face_handle = Some(face_handle);
+    } else {
+        println!("Not on face, {:?}", position_in_triangulation);
+        panic!("Start point is not on a face, no way to handle this yet");
+    }
+
+    let start_face_center_vertex = cdt.face(start_face_handle.unwrap());
+    let end_face_center_vertex = cdt.face(end_face_handle.unwrap());
+
+    let start_face_node = FaceNode::new(start_face_center_vertex);
+    let end_face_node = FaceNode::new(end_face_center_vertex);
+
+    let heuristic_fn = |face_node: &FaceNode| face_node.distance(&end_face_node);
+
+    let sucessors_fn = |face_node: &FaceNode<'a>| -> Vec<(FaceNode<'a>, u32)> {
+        face_node.successors(focus_polygon, &mut processed_face_indices)
+    };
+
+    //TODO: this eq might not be correct if it refers to the actual handle and not the face.
+    let success_fn = |face_node: &FaceNode| face_node.eq(&end_face_node);
+
+    let a_star_results = astar(&start_face_node, sucessors_fn, heuristic_fn, success_fn);
+    let a_star_results = match a_star_results {
+        Some((path, _cost)) => path,
+        None => {
+            println!("No path found");
+            return vec![];
+        }
+    };
+
+    a_star_results
+}
+
+//TODO: test
+fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> geo_types::Polygon<f64> {
+    let linestring = geo_types::LineString::from(
+        face_positions
+            .into_iter()
+            .map(|c| Coord { x: c.x, y: c.y })
+            .collect::<Vec<Coord<f64>>>(),
+    );
+    geo_types::Polygon::new(linestring, vec![])
+}
+
+#[launch]
+fn rocket() -> _ {
+    dotenv().ok();
+    rocket::build().mount("/", routes![index])
 }
 
 /*  #[tokio::main]
