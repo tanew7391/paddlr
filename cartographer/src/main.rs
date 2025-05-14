@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate rocket;
+mod face_node;
 
 use std::env;
 use geo_postgis::FromPostgis;
@@ -10,9 +11,9 @@ use spade::PositionInTriangulation::OnFace;
 use tokio_postgres::{Client, NoTls};
 use dotenv::dotenv;
 
-use geo::{Contains, Coord};
+use geo::Coord;
 use spade::{
-    handles::{FaceHandle, FixedFaceHandle, InnerTag},
+    handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
 };
 use std::{
@@ -30,6 +31,9 @@ use rocket::{
     data::{Data, ToByteUnit},
     tokio,
 };
+
+use crate::face_node::FaceNodeType;
+pub use crate::face_node::FaceNode;
 
 const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 
@@ -441,85 +445,9 @@ async fn index(data: Data<'_>) -> String {
     debug_string
 }
 
-//Start FaceNode
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct FaceNode<'a> {
-    face: FaceHandle<
-        'a,
-        InnerTag,
-        Point2<f64>,
-        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::DirectedEdge,
-        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::UndirectedEdge,
-        <ConstrainedDelaunayTriangulation<Point2<f64>> as Triangulation>::Face,
-    >,
-}
-
-#[derive(PartialEq, Eq)]
-enum FaceNodeType {
-    Inner,
-    Outer,
-}
-
-impl<'a> FaceNode<'a> {
-    fn successors(&self, focus_polygon: &geo_types::Polygon<f64>, checked_faces: &mut HashMap<usize, FaceNodeType>) -> Vec<(FaceNode<'a>, u32)> {
-        let face_node = self.face;
-        let mut successor_faces: Vec<(FaceNode<'a>, u32)> = vec![];
-        for edge in face_node.adjacent_edges() {
-            let adjacent_face = edge.rev().face().as_inner();
-            let adjacent_face = match adjacent_face {
-                Some(face) => face,
-                None => {
-                    // Handle the case where the adjacent face is outer (outer being outside of convex hull in CDT), we don't want to process it.
-                    continue;
-                }
-            };
-
-            let adjacent_center_point = adjacent_face.center();
-            let adjacent_center_point = Coord {
-                x: adjacent_center_point.x,
-                y: adjacent_center_point.y,
-            };
-
-            let adjacent_face_index = adjacent_face.index();
-
-            if !checked_faces.contains_key(&adjacent_face_index) {
-                //We need only process the faces that are inside the focus polygon
-                let face_node_type = match focus_polygon.contains(&adjacent_center_point) {
-                    true => FaceNodeType::Inner,
-                    false => FaceNodeType::Outer,
-                };
-                checked_faces.insert(adjacent_face_index, face_node_type);
-            } 
-            
-            if checked_faces[&adjacent_face_index] == FaceNodeType::Outer {
-                //We need only process the faces that are inside the focus polygon
-                continue;
-            }
-
-            let adjacent_face_node: FaceNode<'a> = FaceNode {
-                face: adjacent_face,
-            };
-            let distance_between_faces = self.distance(&adjacent_face_node);
-            successor_faces.push((adjacent_face_node, distance_between_faces))
-        }
-
-        successor_faces
-    }
-}
-
-impl FaceNode<'_> {
-    //TODO: see if this is discarding SigFigs which could be important for pathfinding
-    fn distance(&self, other: &FaceNode) -> u32 {
-        self.face
-            .center()
-            .distance_2(other.face.center())
-            .sqrt()
-            .round() as u32
-    }
-}
 
 fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
-    let face = face_node.face;
+    let face = face_node.get_face();
     let vertices = face.positions();
     let linestring = geo_types::LineString::from(
         vertices
@@ -570,13 +498,8 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
     let start_face_center_vertex = cdt.face(start_face_handle.unwrap());
     let end_face_center_vertex = cdt.face(end_face_handle.unwrap());
 
-    let start_face_node = FaceNode {
-        face: start_face_center_vertex,
-    };
-
-    let end_face_node = FaceNode {
-        face: end_face_center_vertex,
-    };
+    let start_face_node = FaceNode::new(start_face_center_vertex);
+    let end_face_node = FaceNode::new(end_face_center_vertex);
 
     let heuristic_fn = |face_node: &FaceNode| face_node.distance(&end_face_node);
 
@@ -585,7 +508,7 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
     };
 
     //TODO: this eq might not be correct if it refers to the actual handle and not the face.
-    let success_fn = |face_node: &FaceNode| face_node.face == end_face_node.face;
+    let success_fn = |face_node: &FaceNode| face_node.eq(&end_face_node);
 
     let a_star_results = astar(&start_face_node, sucessors_fn, heuristic_fn, success_fn);
     let a_star_results = match a_star_results {
