@@ -2,7 +2,7 @@
 extern crate rocket;
 mod face_node;
 
-use std::env;
+use std::{env, fs::File, io::{Read, Write}, process::{Command, Stdio}};
 use geo_postgis::FromPostgis;
 use pathfinding::prelude::astar;
 use postgis::ewkb;
@@ -39,7 +39,7 @@ const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 
 async fn get_associated_water_features(
     bounding_area: Bbox,
-) -> Result<GeometryCollection, Box<dyn Error>> {
+) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_box_as_string = bounding_area
@@ -50,17 +50,18 @@ async fn get_associated_water_features(
 
     let query = format!(
         r#"
-        [out:json];
+        [out:xml];
         (
-        way["natural"="water"]({:});
-        relation["natural"="water"]({:});
+        way["natural"="water"]({:})->.ways;
+        relation["natural"="water"]({:})->.relations;
+        way(r.relations)->.relationways;
+        node(w.ways);
+        node(w.relationways);
         );
-        out geom;
+        out meta;
         "#,
         bounding_box_as_string, bounding_box_as_string
     );
-
-    println!("{:}", query);
 
     let res: String = client
         .post(OVERPASS_API_URL)
@@ -70,14 +71,8 @@ async fn get_associated_water_features(
         .await?
         .text()
         .await?;
-    debug!("{:#?}", res);
 
-    //let geometry_collection = convert_osmjson_to_geo(&res);
-
-    //Ok(geometry_collection)
-
-    //This is a temp value until I figure things out
-    Ok(GeometryCollection::default())
+    Ok(res)
 }
 
 fn extract_bounding_box_from_multipoint_geometry(
@@ -219,9 +214,19 @@ async fn index_old(data: Data<'_>) -> String {
     "placeholder".to_string()
 }
 
+async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
+    let sql_path = env::var("SQLPATH").unwrap_or("NO PASS SET".to_string());
+    let mut buf = String::new();
+    File::open(sql_path)?.read_to_string(&mut buf)?;
+    client.batch_execute(&buf).await?;
+
+
+    Ok(())
+}
+
 async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>> {
     let connection_attempt = tokio_postgres::connect(
-        &format!("host=localhost port=5432 user=postgres password={} dbname=gisdb", env::var("db_password").unwrap_or("NO PASS SET".to_string())),
+        &format!("host=localhost port=5432 user=postgres password={} dbname=gisdb", env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string())),
         NoTls,
     )
     .await;
@@ -322,6 +327,62 @@ async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
     Ok((exterior_ring, interior_rings))
 }
 
+fn write_osm_to_database(
+    osm_data: String,
+) -> Result<(), Box<dyn Error>> {
+    let host = env::var("PGHOST")?;
+    let database = env::var("PGDATABASE")?;
+    let user = env::var("PGUSER")?;
+    let password = env::var("PGPASSWORD")?;
+    let port = env::var("PGPORT")?;
+
+
+    let connection_string = format!(
+        "postgresql://{}:{}@{}:{}/{}",
+        user,
+        password,
+        host,
+        port,
+        database
+    );    
+
+    let mut command = Command::new("osm2pgsql")
+        .stdin(Stdio::piped())
+        //todo this may break, test
+        .stdout(Stdio::piped())
+        .arg("-d")
+        .arg(connection_string)
+        .arg("-r")
+        .arg("xml")
+        .arg("/dev/stdin")
+        .spawn()?;
+
+    let mut stdin = command.stdin.take().expect("Failed to open stdin");
+    std::thread::spawn(move || {
+        stdin.write_all(osm_data.as_bytes()).expect("Failed to write to stdin");
+    });
+    
+    let output = command.wait_with_output()?;
+    println!("Command output: {:?}", output);
+    Ok(())
+}
+
+async fn write_user_points_to_db(
+    client: &Client,
+    contained_multipoint_geometry: &Vec<Coord>,
+) -> Result<(), Box<dyn Error>> {
+
+    //let transaction = client.transaction().await?;
+    //let prepared_statement = transaction.prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))").await?;
+
+    //for point in contained_multipoint_geometry {
+    //    transaction.execute(&prepared_statement, &[&point.x, &point.y]).await?;
+    //}
+    //transaction.commit().await?;  
+
+    Ok(())
+}
+
 #[post("/api", data = "<data>")]
 async fn index(data: Data<'_>) -> String {
     let data_string = data.open(1.megabytes()).into_string().await.unwrap();
@@ -333,17 +394,46 @@ async fn index(data: Data<'_>) -> String {
     let bounding_box: Bbox =
         extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
 
-    //Eventually we can use this to plot a direct line between our points
-    //let line_string_json = multipoint_to_linestring(contained_multipoint_geometry);
+/*     let transform_to_wgs84 = Proj::new_known_crs(
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+                "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+            None,
+        ).expect("Failed to create transformer"); */
+
+    let transform_to_pseudo_mercator = Proj::new_known_crs(
+        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+        None,
+    ).expect("Failed to create transformer");
 
     let associated_water_features_future = get_associated_water_features(bounding_box);
     //line_string_json.unwrap().to_string()
     let associated_water_features = associated_water_features_future.await.unwrap();
-    //println!("Water features: {:}", associated_water_features.to_string());
 
-    let client = get_connected_client()
+    write_osm_to_database(associated_water_features).expect("Failed to write OSM data to database");
+
+    let mut client = get_connected_client()
         .await
         .expect("Failed to connect to database");
+
+    //We need to transform here because we cannot pass &Proj to the function with async code
+    let mut transformed_multipoint_geometry: Vec<Coord> = vec![];
+
+/*     for point in contained_multipoint_geometry {
+        let mut coord = Coord {
+            x: point[0],
+            y: point[1],
+        };
+        coord.transform(&transform_to_pseudo_mercator)
+            .expect("Failed to transform coordinate");
+        transformed_multipoint_geometry.push(coord);
+    } */
+
+/*     let up_db = write_user_points_to_db(&mut client, &transformed_multipoint_geometry)
+        .await
+        .expect("Failed to write user points to database"); */
+
+    run_merging_script(&client).await.expect("Failed to run merging script SQL");
 
     let (exterior_ring, interior_rings) =
         retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(&client)
@@ -353,18 +443,6 @@ async fn index(data: Data<'_>) -> String {
     let focus_polygon = get_focus_polygon_from_db(&client)
         .await
         .expect("Failed to retrieve focus polygon");
-
-    let transform_to_wgs84 = Proj::new_known_crs(
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-             "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-            None,
-        ).expect("Failed to create transformer");
-
-    let transform_to_pseudo_mercator = Proj::new_known_crs(
-        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-        None,
-    ).expect("Failed to create transformer");
 
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 
@@ -439,7 +517,7 @@ async fn index(data: Data<'_>) -> String {
         .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
         .collect();
     let mut test = geo_types::GeometryCollection::new_from(test);
-    test.transform(&transform_to_wgs84).expect("Failed to reproject geometry collection");
+    //test.transform(&transform_to_wgs84).expect("Failed to reproject geometry collection");
     let debug_string = Value::from(&test).to_string();
 
     debug_string
