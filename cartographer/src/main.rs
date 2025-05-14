@@ -2,25 +2,26 @@
 extern crate rocket;
 mod face_node;
 
-use std::{env, fs::File, io::{Read, Write}, process::{Command, Stdio}};
+use dotenv::dotenv;
 use geo_postgis::FromPostgis;
 use pathfinding::prelude::astar;
 use postgis::ewkb;
 use proj::{Proj, Transform};
 use spade::PositionInTriangulation::OnFace;
+use std::{
+    env,
+    fs::File,
+    io::{Read, Write},
+    process::{Command, Stdio},
+};
 use tokio_postgres::{Client, NoTls};
-use dotenv::dotenv;
 
 use geo::Coord;
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
 };
-use std::{
-    collections::HashMap,
-    error::Error,
-    vec,
-};
+use std::{collections::HashMap, error::Error, vec};
 
 use log::{self, debug, info, warn};
 
@@ -32,14 +33,14 @@ use rocket::{
     tokio,
 };
 
-use crate::face_node::FaceNodeType;
 pub use crate::face_node::FaceNode;
+use crate::face_node::FaceNodeType;
 
 const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
+const PSEUDO_MERCATOR_CRS: &str = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs";
+const WGS_84_CRS: &str = "+proj=longlat +datum=WGS84 +no_defs +type=crs";
 
-async fn get_associated_water_features(
-    bounding_area: Bbox,
-) -> Result<String, Box<dyn Error>> {
+async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_box_as_string = bounding_area
@@ -220,13 +221,15 @@ async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
     File::open(sql_path)?.read_to_string(&mut buf)?;
     client.batch_execute(&buf).await?;
 
-
     Ok(())
 }
 
 async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>> {
     let connection_attempt = tokio_postgres::connect(
-        &format!("host=localhost port=5432 user=postgres password={} dbname=gisdb", env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string())),
+        &format!(
+            "host=localhost port=5432 user=postgres password={} dbname=gisdb",
+            env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string())
+        ),
         NoTls,
     )
     .await;
@@ -327,24 +330,17 @@ async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
     Ok((exterior_ring, interior_rings))
 }
 
-fn write_osm_to_database(
-    osm_data: String,
-) -> Result<(), Box<dyn Error>> {
+fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
     let host = env::var("PGHOST")?;
     let database = env::var("PGDATABASE")?;
     let user = env::var("PGUSER")?;
     let password = env::var("PGPASSWORD")?;
     let port = env::var("PGPORT")?;
 
-
     let connection_string = format!(
         "postgresql://{}:{}@{}:{}/{}",
-        user,
-        password,
-        host,
-        port,
-        database
-    );    
+        user, password, host, port, database
+    );
 
     let mut command = Command::new("osm2pgsql")
         .stdin(Stdio::piped())
@@ -359,26 +355,46 @@ fn write_osm_to_database(
 
     let mut stdin = command.stdin.take().expect("Failed to open stdin");
     std::thread::spawn(move || {
-        stdin.write_all(osm_data.as_bytes()).expect("Failed to write to stdin");
+        stdin
+            .write_all(osm_data.as_bytes())
+            .expect("Failed to write to stdin");
     });
-    
+
     let output = command.wait_with_output()?;
     println!("Command output: {:?}", output);
     Ok(())
 }
 
 async fn write_user_points_to_db(
-    client: &Client,
-    contained_multipoint_geometry: &Vec<Coord>,
+    client: &mut Client,
+    contained_multipoint_geometry: &Vec<PointType>,
 ) -> Result<(), Box<dyn Error>> {
+    let mut transformed_multipoint_geometry: Vec<Coord> = vec![];
 
-    //let transaction = client.transaction().await?;
-    //let prepared_statement = transaction.prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))").await?;
+    for point in contained_multipoint_geometry {
+        let mut coord = Coord {
+            x: point[0],
+            y: point[1],
+        };
+        coord
+            .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+            .expect("Failed to transform coordinate");
+        transformed_multipoint_geometry.push(coord);
+    }
+    let transaction = client.transaction().await?;
 
-    //for point in contained_multipoint_geometry {
-    //    transaction.execute(&prepared_statement, &[&point.x, &point.y]).await?;
-    //}
-    //transaction.commit().await?;  
+    transaction.execute("DELETE FROM points", &[]).await?;
+
+    let prepared_statement = transaction
+        .prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))")
+        .await?;
+
+    for point in transformed_multipoint_geometry {
+        transaction
+            .execute(&prepared_statement, &[&point.x, &point.y])
+            .await?;
+    }
+    transaction.commit().await?;
 
     Ok(())
 }
@@ -394,18 +410,6 @@ async fn index(data: Data<'_>) -> String {
     let bounding_box: Bbox =
         extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
 
-/*     let transform_to_wgs84 = Proj::new_known_crs(
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-                "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-            None,
-        ).expect("Failed to create transformer"); */
-
-    let transform_to_pseudo_mercator = Proj::new_known_crs(
-        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-        None,
-    ).expect("Failed to create transformer");
-
     let associated_water_features_future = get_associated_water_features(bounding_box);
     //line_string_json.unwrap().to_string()
     let associated_water_features = associated_water_features_future.await.unwrap();
@@ -416,24 +420,13 @@ async fn index(data: Data<'_>) -> String {
         .await
         .expect("Failed to connect to database");
 
-    //We need to transform here because we cannot pass &Proj to the function with async code
-    let mut transformed_multipoint_geometry: Vec<Coord> = vec![];
-
-/*     for point in contained_multipoint_geometry {
-        let mut coord = Coord {
-            x: point[0],
-            y: point[1],
-        };
-        coord.transform(&transform_to_pseudo_mercator)
-            .expect("Failed to transform coordinate");
-        transformed_multipoint_geometry.push(coord);
-    } */
-
-/*     let up_db = write_user_points_to_db(&mut client, &transformed_multipoint_geometry)
+    write_user_points_to_db(&mut client, &contained_multipoint_geometry)
         .await
-        .expect("Failed to write user points to database"); */
+        .expect("Failed to write user points to database");
 
-    run_merging_script(&client).await.expect("Failed to run merging script SQL");
+    run_merging_script(&client)
+        .await
+        .expect("Failed to run merging script SQL");
 
     let (exterior_ring, interior_rings) =
         retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(&client)
@@ -471,14 +464,9 @@ async fn index(data: Data<'_>) -> String {
             cdt.add_constraint_edge(new_edge[0], new_edge[1])
                 .expect(&format!("Unable to add constraint edge: {:?}", new_edge));
         }
-        //current_interior_index += points.len();
-
-        //vertices.extend(points);
     }
 
     println!("Last interior ring edge: {:?}", edges.last());
-
-    //Debug mode
 
     //let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
 
@@ -501,6 +489,19 @@ async fn index(data: Data<'_>) -> String {
         y: contained_multipoint_geometry[1][1],
     };
 
+    //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
+    let transform_to_wgs84 = Proj::new_known_crs(
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+                "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+            None,
+        ).expect("Failed to create transformer");
+
+    let transform_to_pseudo_mercator = Proj::new_known_crs(
+        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
+        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
+        None,
+    ).expect("Failed to create transformer");
+
     start.transform(&transform_to_pseudo_mercator).unwrap();
     end.transform(&transform_to_pseudo_mercator).unwrap();
 
@@ -511,18 +512,17 @@ async fn index(data: Data<'_>) -> String {
 
     let polygon_path = compute_A_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
 
-
     let test: Vec<geo_types::Geometry<f64>> = polygon_path
         .iter()
         .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
         .collect();
     let mut test = geo_types::GeometryCollection::new_from(test);
-    //test.transform(&transform_to_wgs84).expect("Failed to reproject geometry collection");
+    test.transform(&transform_to_wgs84)
+        .expect("Failed to reproject geometry collection");
     let debug_string = Value::from(&test).to_string();
 
     debug_string
 }
-
 
 fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
     let face = face_node.get_face();

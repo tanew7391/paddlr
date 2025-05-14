@@ -69,6 +69,7 @@ impl<'a> FaceNode<'a> {
 
             if !checked_faces.contains_key(&adjacent_face_index) {
                 //We need only process the faces that are inside the focus polygon
+                //TODO: This is a very expensive operation - working on this would improve performance
                 let face_node_type = match focus_polygon.contains(&adjacent_center_point) {
                     true => FaceNodeType::Inner,
                     false => FaceNodeType::Outer,
