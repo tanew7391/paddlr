@@ -16,7 +16,7 @@ use std::{
 };
 use tokio_postgres::{Client, NoTls};
 
-use geo::Coord;
+use geo::{coord, Coord, Line};
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
@@ -293,6 +293,7 @@ async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
         }
     };
 
+    //TODO: strange error coming from here
     let polygon: ewkb::Polygon = rows[0].get("geom");
     let exterior_ring = Option::from_postgis(&polygon);
 
@@ -512,17 +513,33 @@ async fn index(data: Data<'_>) -> String {
 
     let polygon_path = compute_A_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
 
-    let test: Vec<geo_types::Geometry<f64>> = polygon_path
+    let test: Vec<geo::Coord<f64>> = generate_portals(&polygon_path)
+        .iter()
+        .map(|p| {
+            coord! {x: p.x, y: p.y }
+        }).collect();
+
+    let test: Vec<Line> = test.iter().enumerate().map(|(i, val)| {
+        if i < test.len() - 1 {
+            Line::new(*val, test[i + 1])
+        } else {
+            Line::new(*val, test[0]) // Connect last point to the first
+        }
+    } ).collect();
+
+    /* let test: Vec<geo_types::Geometry<f64>> = polygon_path
         .iter()
         .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
-        .collect();
-    let mut test = geo_types::GeometryCollection::new_from(test);
+        .collect(); */
+    let mut test = geo_types::GeometryCollection::from(test);
     test.transform(&transform_to_wgs84)
         .expect("Failed to reproject geometry collection");
     let debug_string = Value::from(&test).to_string();
 
     debug_string
 }
+
+
 
 fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
     let face = face_node.get_face();
@@ -599,6 +616,52 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
 
     a_star_results
 }
+
+
+fn triangle_area_sq(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f64 {
+    let ax = b.x - a.x;
+    let ay = b.y - a.y;
+    let bx = c.x - a.x;
+    let by = c.y - a.y;
+    ax * by - ay * bx
+}
+
+fn generate_portals(
+    face_nodes: &Vec<FaceNode>,
+    ) -> Vec<Point2<f64>> {
+    let mut portals: Vec<Point2<f64>> = Vec::new();
+    for i in 0..face_nodes.len() {
+        let current = &face_nodes[i];
+        let next = face_nodes.get(i + 1);
+        let next = match next {
+            Some(next) => next,
+            None => {
+                continue;
+            }
+        };
+        let current_face = current.get_face();
+        let next_face = next.get_face();
+        for current_edge in current_face.adjacent_edges(){
+            for next_face_edge in next_face.adjacent_edges() {
+                if current_edge.rev() == next_face_edge{
+                    //This order matters. TODO: see if producing correct portals
+                    portals.push(current_edge.from().position());
+                    portals.push(current_edge.to().position());
+                }
+            }
+        }
+            
+    }
+
+    portals
+}
+
+/* fn stringPull(
+    portals: &Vec<Point2<f64>>,
+) {
+
+} */
+
 
 //TODO: test
 fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> geo_types::Polygon<f64> {
