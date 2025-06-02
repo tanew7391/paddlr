@@ -25,8 +25,6 @@ use std::{collections::HashMap, error::Error, vec};
 
 use log::{self, debug, info, warn};
 
-use geo_types::GeometryCollection;
-
 use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
 use rocket::{
     data::{Data, ToByteUnit},
@@ -111,108 +109,6 @@ fn extract_multipoint_geometry(geojson: GeoJson) -> Result<Vec<PointType>, Box<d
     }
 
     Err("GeoJSON does not include a multipoint geometry".into())
-}
-
-//Deprecated
-/*
-fn multipoint_to_linestring(multipoints: Vec<PointType>) -> GeoJson {
-    // Convert MultiPoint coordinates to LineString
-    let linestring_coords = multipoints;
-
-    // Create the LineString GeoJSON geometry
-    let linestring_geometry = Geometry::new(Value::LineString(linestring_coords));
-
-    // Create a new GeoJSON feature with the LineString geometry
-    let linestring_feature = geojson::Feature {
-        geometry: Some(linestring_geometry),
-        properties: linestring_feature.properties,
-        ..Default::default()
-    };
-
-    // Wrap the feature in GeoJson and return it
-    return GeoJson::Feature(linestring_feature);
-} */
-
-// Deprecated
-async fn index_old(data: Data<'_>) -> String {
-    //let data_string = data.open(1.megabytes()).into_string().await.unwrap();
-
-    //let json = data_string.parse::<GeoJson>().unwrap();
-
-    //let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
-
-    //let bounding_box: Bbox =
-    //    extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
-
-    //let line_string_json = multipoint_to_linestring(json);
-    //let associated_water_features_future = get_associated_water_features(bounding_box);
-    //line_string_json.unwrap().to_string()
-    //let associated_water_features = associated_water_features_future.await.unwrap();
-    //println!("Water features: {:}", associated_water_features.to_string());
-
-    //gdal_geom::from_wkb(wkb)
-
-    //let defined_point = Point::new(
-    //    contained_multipoint_geometry[0][0],
-    //    contained_multipoint_geometry[0][1],
-    //);
-
-    //println!("After conv: {:#?}", collection);
-
-    //let possible_containing_polygon =
-    //    find_containing_polygon(&defined_point, &associated_water_features);
-
-    //let geometry_container_reference_holder = Vec::from_iter(associated_water_features.iter());
-
-    //let geojson_of_associated_water_features = Value::from(&geo::Geometry::GeometryCollection(associated_water_features));
-    //println!("{:#?}", geojson_of_associated_water_features);
-    //return geojson_of_associated_water_features.to_string();
-
-    //let containing_polygon = match possible_containing_polygon {
-    //    Some(polygon) => polygon,
-    //    None => panic!("No containing polygon!!!")
-    //};
-
-    // Connect to the database.
-    let (client, connection) = tokio_postgres::connect(
-        "host=localhost port=5432 user=postgres password=postgres dbname=gisdb",
-        NoTls,
-    )
-    .await
-    .unwrap();
-
-    // The connection object performs the actual communication with the database,
-    // so spawn it off to run on its own.
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
-
-    let mut polygons: Vec<geo_types::Geometry> = Vec::new();
-
-    let rows = client
-        .query(
-            "SELECT ST_Multi(ST_Transform(polygon, 4326)) as polygon FROM focus_polygon",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    for row in &rows {
-        let polygon: ewkb::MultiPolygon = row.get("polygon");
-        let focus_polygon = geo_types::MultiPolygon::from_postgis(&polygon);
-        polygons.push(geo_types::Geometry::from(focus_polygon));
-    }
-
-    //temporarily disabling
-    Value::from(&geo::Geometry::GeometryCollection(
-        GeometryCollection::new_from(polygons),
-    ))
-    .to_string();
-
-    //test().await
-    "placeholder".to_string()
 }
 
 async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
@@ -511,35 +407,71 @@ async fn index(data: Data<'_>) -> String {
 
     //End Temp
 
-    let polygon_path = compute_A_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
+    let polygon_path = compute_a_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
 
-    let test: Vec<geo::Coord<f64>> = generate_portals(&polygon_path)
+    let mut portals = generate_portals(&polygon_path);
+    portals.insert(0, start);
+    portals.insert(1, start);
+    portals.push(end);
+    portals.push(end);
+
+    let mut portals_geo_collection = geo_types::GeometryCollection::from(
+        portals
+            .iter()
+            .map(|p| geo::Point::from(coord! {x: p.x, y: p.y }))
+            .collect::<Vec<geo::Point<f64>>>(),
+    );
+
+    portals_geo_collection.transform(&transform_to_wgs84)
+            .expect("Failed to reproject geometry collection");
+
+    let portals_geo_json = Value::from(&portals_geo_collection).to_string();
+
+    let mut file = File::create("testing/portals.geojson").unwrap();
+    file.write_all(portals_geo_json.as_bytes()).unwrap();
+
+    let portals_transformed_TEST = portals.iter()
+            .map(|p| 
+                {
+                    let mut pt = geo::Point::from(coord! {x: p.x, y: p.y });
+                    pt.transform(&transform_to_wgs84).unwrap();
+                    Point2::new(pt.x(), pt.y())
+                }
+            )
+            .collect::<Vec<Point2<f64>>>();
+    
+    let path = stringPull(&portals_transformed_TEST, portals_transformed_TEST.len());
+
+    let test: Vec<geo::Coord<f64>> = path
         .iter()
         .map(|p| {
             coord! {x: p.x, y: p.y }
-        }).collect();
+        })
+        .collect();
 
-    let test: Vec<Line> = test.iter().enumerate().map(|(i, val)| {
-        if i < test.len() - 1 {
-            Line::new(*val, test[i + 1])
-        } else {
-            Line::new(*val, test[0]) // Connect last point to the first
-        }
-    } ).collect();
-
-    /* let test: Vec<geo_types::Geometry<f64>> = polygon_path
+    let test: Vec<Line> = test
         .iter()
-        .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
-        .collect(); */
+        .enumerate()
+        .map(|(i, val)| {
+            if i < test.len() - 1 {
+                Line::new(*val, test[i + 1])
+            } else {
+                Line::new(*val, test[0]) // Connect last point to the first
+            }
+        })
+        .collect();
+
+    /*     let test: Vec<geo_types::Geometry<f64>> = polygon_path
+            .iter()
+            .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
+            .collect(); */
     let mut test = geo_types::GeometryCollection::from(test);
-    test.transform(&transform_to_wgs84)
-        .expect("Failed to reproject geometry collection");
+    /* test.transform(&transform_to_wgs84)
+        .expect("Failed to reproject geometry collection"); */
     let debug_string = Value::from(&test).to_string();
 
     debug_string
 }
-
-
 
 fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
     let face = face_node.get_face();
@@ -554,7 +486,7 @@ fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
 }
 //End FaceNode
 
-fn compute_A_star_pathfinding_from_delaney<'a>(
+fn compute_a_star_pathfinding_from_delaney<'a>(
     start: Point2<f64>,
     end: Point2<f64>,
     cdt: &'a ConstrainedDelaunayTriangulation<Point2<f64>>,
@@ -602,7 +534,6 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
         face_node.successors(focus_polygon, &mut processed_face_indices)
     };
 
-    //TODO: this eq might not be correct if it refers to the actual handle and not the face.
     let success_fn = |face_node: &FaceNode| face_node.eq(&end_face_node);
 
     let a_star_results = astar(&start_face_node, sucessors_fn, heuristic_fn, success_fn);
@@ -617,18 +548,16 @@ fn compute_A_star_pathfinding_from_delaney<'a>(
     a_star_results
 }
 
-
-fn triangle_area_sq(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f64 {
-    let ax = b.x - a.x;
-    let ay = b.y - a.y;
-    let bx = c.x - a.x;
-    let by = c.y - a.y;
-    ax * by - ay * bx
+fn triangle_area_2(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f32 {
+    let ax = b.x as f32 - a.x as f32;
+    let ay = b.y as f32  - a.y as f32;
+    let bx = c.x as f32 - a.x as f32;
+    let by = c.y as f32 - a.y as f32;
+    let cross_product = bx * ay - ax * by;
+    cross_product as f32
 }
 
-fn generate_portals(
-    face_nodes: &Vec<FaceNode>,
-    ) -> Vec<Point2<f64>> {
+fn generate_portals(face_nodes: &Vec<FaceNode>) -> Vec<Point2<f64>> {
     let mut portals: Vec<Point2<f64>> = Vec::new();
     for i in 0..face_nodes.len() {
         let current = &face_nodes[i];
@@ -641,27 +570,116 @@ fn generate_portals(
         };
         let current_face = current.get_face();
         let next_face = next.get_face();
-        for current_edge in current_face.adjacent_edges(){
+        for current_edge in current_face.adjacent_edges() {
             for next_face_edge in next_face.adjacent_edges() {
-                if current_edge.rev() == next_face_edge{
+                if current_edge.rev() == next_face_edge {
                     //This order matters. TODO: see if producing correct portals
-                    portals.push(current_edge.from().position());
                     portals.push(current_edge.to().position());
+                    portals.push(current_edge.from().position());
                 }
             }
         }
-            
     }
 
     portals
 }
 
-/* fn stringPull(
-    portals: &Vec<Point2<f64>>,
-) {
+fn vequal(a: &Point2<f64>, b: &Point2<f64>) -> bool {
+    let tolerance = 0.001 * 0.001;
+    
+    let equal = ((b.x as f32 - a.x as f32)*(b.x as f32 - a.x as f32) + (b.y as f32 - a.y as f32)*(b.y as f32 - a.y as f32)) < tolerance;
+    equal
+}
 
-} */
+fn stringPull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>> {
+    let mut points: Vec<Point2<f64>> = vec![];
+    let mut portal_apex: Point2<f64> = portals[0];
+    let mut portal_left: Point2<f64> = portals[0];
+    let mut portal_right: Point2<f64> = portals[1];
+    let mut apex_index = 0;
+    let mut left_index = 0;
+    let mut right_index = 0;
 
+    points.push(portal_apex);
+
+    let mut i = 1;
+    while (i < portals.len()) && (points.len() < max_points) {
+        i = i+1;
+        let left = portals.get(i*2); //TODO check if this is correct
+        let right = portals.get((i*2) + 1);
+
+        let left = match left {
+            Some(point) => point,
+            None => {
+                break;
+            }
+        };
+
+        let right = match right {
+            Some(point) => point,
+            None => {
+                break;
+            }
+        };
+
+        if triangle_area_2(&portal_apex, &portal_right, right) <= 0.0 {
+            if vequal(&portal_apex, &portal_right)
+                || triangle_area_2(&portal_apex, &portal_left, right) > 0.0
+            {
+                //Check if the left and right points are inside the current funnel (described by the blue and red lines), if they are, we simple narrow the funnel (A-D).
+                //Tighten funnel
+                portal_right = *right;
+                right_index = i;
+            } else {
+                // Right over left, insert left to path and restart scan from portal left point.
+                points.push(portal_left);
+
+                portal_apex = portal_left;
+                apex_index = left_index;
+
+                portal_left = portal_apex;
+                portal_right = portal_apex;
+                left_index = apex_index;
+                right_index = apex_index;
+
+                i = apex_index;
+                continue;
+            }
+        }
+
+        if triangle_area_2(&portal_apex, &portal_left, left) >= 0.0 {
+            if vequal(&portal_apex, &portal_left)
+                || triangle_area_2(&portal_apex, &portal_right, left) < 0.0
+            {
+                //Tighten funnel
+                portal_left = *left;
+                left_index = i;
+            } else {
+                points.push(portal_right);
+
+                portal_apex = portal_right;
+                apex_index = right_index;
+
+                portal_left = portal_apex;
+                portal_right = portal_apex;
+                left_index = apex_index;
+                right_index = apex_index;
+
+                i = apex_index;
+                continue;
+            }
+        }
+    }
+
+    if points.len() < max_points {
+        points.push(portals.last().unwrap().clone());
+    }
+
+    println!("Points len: {:}", points.len());
+    println!("Check if this is: {:}", (-0.0 < 0.0));
+
+    points
+}
 
 //TODO: test
 fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> geo_types::Polygon<f64> {
