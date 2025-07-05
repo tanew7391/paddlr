@@ -3,3 +3,4 @@
 .vscode/
 test_files/*
 *output.txt
+/osm_downloads/*
