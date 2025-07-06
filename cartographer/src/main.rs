@@ -3,6 +3,7 @@ extern crate rocket;
 mod face_node;
 
 use dotenv::dotenv;
+use geo_buffer::buffer_polygon;
 use geo_postgis::FromPostgis;
 use pathfinding::prelude::astar;
 use postgis::ewkb;
@@ -16,13 +17,14 @@ use std::{
 };
 use tokio_postgres::{Client, NoTls};
 
-use geo::{coord, Coord, Line};
+use geo::{coord, BooleanOps, Coord, HasDimensions, Intersects, Line};
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
 };
 use std::{collections::HashMap, error::Error, vec};
 
+use env_logger;
 use log::{self, debug, info, warn};
 
 use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
@@ -70,6 +72,10 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Bo
         .await?
         .text()
         .await?;
+
+    if res.len() < 1000 {
+        info!("Overpass API returned  {:?}", res);
+    }
 
     Ok(res)
 }
@@ -137,6 +143,7 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
             return Err(e.into());
         }
     };
+
 
     // The connection object performs the actual communication with the database,
     // so spawn it off to run on its own.
@@ -227,6 +234,36 @@ async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
     Ok((exterior_ring, interior_rings))
 }
 
+// Simplifies the search area to the intersection of the focus polygon and the bounding rectangle defined by start and end coordinates.
+// Only returns a polygon if both start and end points are contained within the intersection polygon.
+// Otherwise we would not be able to find a path between the two points.
+fn simplify_search_area(
+    start: geo::Coord<f64>,
+    end: geo::Coord<f64>,
+    focus_polygon: &geo::Polygon,
+) -> Option<geo::Polygon<f64>> {
+    let bounding_rect: geo::Polygon = geo::Rect::new(start, end).into();
+    //Buffered because floating point preceision issues can cause problems when checking if the start and end points are contained within the intersection.
+    let buffered_bounding_rect = buffer_polygon(&bounding_rect, 0.0001);
+
+    let intersection = focus_polygon.intersection(&buffered_bounding_rect);
+    if intersection.is_empty() {
+        warn!("No intersection found between focus polygon and bounding rectangle.");
+        return None;
+    }
+
+    for polygon in intersection {
+        if polygon.intersects(&start) && polygon.intersects(&end) {
+            // If the start and end points are contained within the polygon, return it
+            return Some(polygon);
+        }
+    }
+
+    info!("Start or end point is not contained within the intersection polygon.");
+
+    return None;
+}
+
 fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
     let host = env::var("PGHOST")?;
     let database = env::var("PGDATABASE")?;
@@ -258,7 +295,7 @@ fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
     });
 
     let output = command.wait_with_output()?;
-    println!("Command output: {:?}", output);
+    info!("Command output: {:?}", output);
     Ok(())
 }
 
@@ -297,19 +334,24 @@ async fn write_user_points_to_db(
 }
 
 #[post("/api", data = "<data>")]
-async fn index(data: Data<'_>) -> String {
+async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
     let data_string = data.open(1.megabytes()).into_string().await.unwrap();
 
     let json = data_string.parse::<GeoJson>().unwrap();
 
     let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
 
-    let bounding_box: Bbox =
+    let bounding_boxes: Bbox =
         extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
 
-    let associated_water_features_future = get_associated_water_features(bounding_box);
+    let associated_water_features_future = get_associated_water_features(bounding_boxes);
     //line_string_json.unwrap().to_string()
-    let associated_water_features = associated_water_features_future.await.unwrap();
+    let associated_water_features = match associated_water_features_future.await {
+        Ok(features) => features,
+        Err(_e) => {
+            return Err(rocket::http::Status::NotFound);
+        }
+    };
 
     write_osm_to_database(associated_water_features).expect("Failed to write OSM data to database");
 
@@ -330,9 +372,41 @@ async fn index(data: Data<'_>) -> String {
             .await
             .expect("Failed to retrieve exterior and interior rings");
 
-    let focus_polygon = get_focus_polygon_from_db(&client)
+    let mut focus_polygon = get_focus_polygon_from_db(&client)
         .await
         .expect("Failed to retrieve focus polygon");
+
+    //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
+    let transform_to_wgs84 = Proj::new_known_crs(PSEUDO_MERCATOR_CRS, WGS_84_CRS, None)
+        .expect("Failed to create transformer");
+
+    let transform_to_pseudo_mercator = Proj::new_known_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS, None)
+        .expect("Failed to create transformer");
+
+    //Temp
+    let mut start = Coord {
+        x: contained_multipoint_geometry[0][0],
+        y: contained_multipoint_geometry[0][1],
+    };
+    let mut end = Coord {
+        x: contained_multipoint_geometry[1][0],
+        y: contained_multipoint_geometry[1][1],
+    };
+
+    start.transform(&transform_to_pseudo_mercator).unwrap();
+    end.transform(&transform_to_pseudo_mercator).unwrap();
+
+    //TODO combine with interior rings
+    //TODO check when we should actually simplify the search area (what number of points is too few?)
+    if focus_polygon.exterior().points().len() > 1000 {
+        let new_search_area = simplify_search_area(start, end, &focus_polygon);
+        if let Some(new_polygon) = new_search_area {
+            // Use the new polygon for pathfinding
+            focus_polygon = new_polygon;
+        } else {
+            info!("No valid search area found, using original focus polygon.");
+        }
+    }
 
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 
@@ -346,7 +420,7 @@ async fn index(data: Data<'_>) -> String {
         });
 
     //let mut current_interior_index = vertices.len();
-    let mut edges: Vec<[usize; 2]> = Vec::new();
+    let edges: Vec<[usize; 2]> = Vec::new();
 
     for interior_ring in &interior_rings {
         let points: Vec<Point2<f64>> = interior_ring
@@ -357,63 +431,41 @@ async fn index(data: Data<'_>) -> String {
 
         for i in 0..points.len() {
             let new_edge: [Point2<f64>; 2] = [points[i], points[(i + 1) % points.len()]];
-            //edges.push(new_edge);
             cdt.add_constraint_edge(new_edge[0], new_edge[1])
                 .expect(&format!("Unable to add constraint edge: {:?}", new_edge));
         }
     }
 
-    println!("Last interior ring edge: {:?}", edges.last());
+    info!("Last interior ring edge: {:?}", edges.last());
 
-    //let cdt: Result<ConstrainedDelaunayTriangulation<Point2<f64>>, spade::InsertionError> = ConstrainedDelaunayTriangulation::<_>::bulk_load_cdt(vertices, edges);
-
-    println!(
+    info!(
         "Number of Undirected Edges: {:}",
         cdt.num_undirected_edges()
     );
-    println!("Number of Directed Edges: {:}", cdt.num_directed_edges());
-    println!("Number of Vertices: {:}", cdt.num_vertices());
-    println!("Number of Faces: {:}", cdt.num_all_faces());
-    println!("Number of Inner Faces: {:}", cdt.num_inner_faces());
+    info!("Number of Directed Edges: {:}", cdt.num_directed_edges());
+    info!("Number of Vertices: {:}", cdt.num_vertices());
+    info!("Number of Faces: {:}", cdt.num_all_faces());
+    info!("Number of Inner Faces: {:}", cdt.num_inner_faces());
 
-    //Temp
-    let mut start = Coord {
-        x: contained_multipoint_geometry[0][0],
-        y: contained_multipoint_geometry[0][1],
-    };
-    let mut end = Coord {
-        x: contained_multipoint_geometry[1][0],
-        y: contained_multipoint_geometry[1][1],
-    };
+    let start_cdt = Point2::new(start.x, start.y);
+    let end_cdt = Point2::new(end.x, end.y);
 
-    //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
-    let transform_to_wgs84 = Proj::new_known_crs(
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-                "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-            None,
-        ).expect("Failed to create transformer");
-
-    let transform_to_pseudo_mercator = Proj::new_known_crs(
-        "+proj=longlat +datum=WGS84 +no_defs +type=crs",
-        "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs",
-        None,
-    ).expect("Failed to create transformer");
-
-    start.transform(&transform_to_pseudo_mercator).unwrap();
-    end.transform(&transform_to_pseudo_mercator).unwrap();
-
-    let start = Point2::new(start.x, start.y);
-    let end = Point2::new(end.x, end.y);
+    info!(
+        "Focus Polygon Verticies: {:?}",
+        focus_polygon.exterior().points().len()
+    );
 
     //End Temp
 
-    let polygon_path = compute_a_star_pathfinding_from_delaney(start, end, &cdt, &focus_polygon);
+    let polygon_path =
+        compute_a_star_pathfinding_from_delaney(start_cdt, end_cdt, &cdt, &focus_polygon);
 
-    let mut portals = generate_portals(&polygon_path);
-    portals.insert(0, start);
-    portals.insert(1, start);
-    portals.push(end);
-    portals.push(end);
+    if polygon_path.is_empty() {
+        info!("No path found, returning empty string");
+        return Err(rocket::http::Status::NotFound);
+    }
+
+    let portals = generate_portals(&polygon_path, &start_cdt, &end_cdt);
 
     let mut portals_geo_collection = geo_types::GeometryCollection::from(
         portals
@@ -422,55 +474,54 @@ async fn index(data: Data<'_>) -> String {
             .collect::<Vec<geo::Point<f64>>>(),
     );
 
-    portals_geo_collection.transform(&transform_to_wgs84)
-            .expect("Failed to reproject geometry collection");
+    portals_geo_collection
+        .transform(&transform_to_wgs84)
+        .expect("Failed to reproject geometry collection");
 
     let portals_geo_json = Value::from(&portals_geo_collection).to_string();
 
     let mut file = File::create("testing/portals.geojson").unwrap();
     file.write_all(portals_geo_json.as_bytes()).unwrap();
 
-    let portals_transformed_TEST = portals.iter()
-            .map(|p| 
-                {
-                    let mut pt = geo::Point::from(coord! {x: p.x, y: p.y });
-                    pt.transform(&transform_to_wgs84).unwrap();
-                    Point2::new(pt.x(), pt.y())
-                }
-            )
-            .collect::<Vec<Point2<f64>>>();
-    
-    let path = stringPull(&portals_transformed_TEST, portals_transformed_TEST.len());
+    /*     let portals_transformed_TEST = portals.iter()
+    .map(|p|
+        {
+            let mut pt = geo::Point::from(coord! {x: p.x, y: p.y });
+            pt.transform(&transform_to_wgs84).unwrap();
+            Point2::new(pt.x(), pt.y())
+        }
+    )
+    .collect::<Vec<Point2<f64>>>(); */
 
-    let test: Vec<geo::Coord<f64>> = path
+    let path = string_pull(&portals, portals.len());
+
+    let path_as_geom: Vec<geo::Coord<f64>> = path
         .iter()
         .map(|p| {
             coord! {x: p.x, y: p.y }
         })
         .collect();
 
-    let test: Vec<Line> = test
-        .iter()
-        .enumerate()
-        .map(|(i, val)| {
-            if i < test.len() - 1 {
-                Line::new(*val, test[i + 1])
-            } else {
-                Line::new(*val, test[0]) // Connect last point to the first
-            }
-        })
-        .collect();
+    let mut test: Vec<Line> = vec![];
+
+    path_as_geom.iter().enumerate().for_each(|(i, val)| {
+        if i < path_as_geom.len() - 1 {
+            test.push(Line::new(*val, path_as_geom[i + 1]))
+        }
+    });
 
     /*     let test: Vec<geo_types::Geometry<f64>> = polygon_path
-            .iter()
-            .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
-            .collect(); */
-    let mut test = geo_types::GeometryCollection::from(test);
-    /* test.transform(&transform_to_wgs84)
-        .expect("Failed to reproject geometry collection"); */
-    let debug_string = Value::from(&test).to_string();
+    .iter()
+    .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
+    .collect();*/
+    let mut line = geo_types::GeometryCollection::from(test);
+    //let mut focus_polygon_final = geo_types::GeometryCollection::from(focus_polygon);
 
-    debug_string
+    line.transform(&transform_to_wgs84)
+        .expect("Failed to reproject geometry collection");
+    let info_string = Value::from(&line).to_string();
+
+    Ok(info_string)
 }
 
 fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
@@ -498,16 +549,16 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
 
     let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
     //let start_transformed = start.transform(&transformer).unwrap();
-    println!("Start transformed: {:?}", start);
+    info!("Start transformed: {:?}", start);
     let position_in_triangulation = cdt.locate(start);
 
     //Todo: test if a start or end point is on a vertex or an edge
     let mut start_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
     if let OnFace(face_handle) = position_in_triangulation {
-        println!("On face: {:?}", face_handle.index());
+        info!("On face: {:?}", face_handle.index());
         start_face_handle = Some(face_handle);
     } else {
-        println!("Not on face, {:?}", position_in_triangulation);
+        info!("Not on face, {:?}", position_in_triangulation);
         panic!("Start point is not on a face, no way to handle this yet");
     }
 
@@ -515,10 +566,10 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     let position_in_triangulation = cdt.locate(end);
     let mut end_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
     if let OnFace(face_handle) = position_in_triangulation {
-        println!("On face: {:?}", face_handle.index());
+        info!("On face: {:?}", face_handle.index());
         end_face_handle = Some(face_handle);
     } else {
-        println!("Not on face, {:?}", position_in_triangulation);
+        info!("Not on face, {:?}", position_in_triangulation);
         panic!("Start point is not on a face, no way to handle this yet");
     }
 
@@ -540,7 +591,7 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     let a_star_results = match a_star_results {
         Some((path, _cost)) => path,
         None => {
-            println!("No path found");
+            info!("No path found");
             return vec![];
         }
     };
@@ -550,15 +601,17 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
 
 fn triangle_area_2(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f32 {
     let ax = b.x as f32 - a.x as f32;
-    let ay = b.y as f32  - a.y as f32;
+    let ay = b.y as f32 - a.y as f32;
     let bx = c.x as f32 - a.x as f32;
     let by = c.y as f32 - a.y as f32;
     let cross_product = bx * ay - ax * by;
     cross_product as f32
 }
 
-fn generate_portals(face_nodes: &Vec<FaceNode>) -> Vec<Point2<f64>> {
+fn generate_portals(face_nodes: &Vec<FaceNode>, start_node: &Point2<f64>, end_node: &Point2<f64>) -> Vec<Point2<f64>> {
     let mut portals: Vec<Point2<f64>> = Vec::new();
+    portals.push(start_node.clone());
+    portals.push(start_node.clone());
     for i in 0..face_nodes.len() {
         let current = &face_nodes[i];
         let next = face_nodes.get(i + 1);
@@ -581,22 +634,28 @@ fn generate_portals(face_nodes: &Vec<FaceNode>) -> Vec<Point2<f64>> {
         }
     }
 
+    portals.push(end_node.clone());
+    portals.push(end_node.clone());
+
+
     portals
 }
 
 fn vequal(a: &Point2<f64>, b: &Point2<f64>) -> bool {
     let tolerance = 0.001 * 0.001;
-    
-    let equal = ((b.x as f32 - a.x as f32)*(b.x as f32 - a.x as f32) + (b.y as f32 - a.y as f32)*(b.y as f32 - a.y as f32)) < tolerance;
+
+    let equal = ((b.x as f32 - a.x as f32) * (b.x as f32 - a.x as f32)
+        + (b.y as f32 - a.y as f32) * (b.y as f32 - a.y as f32))
+        < tolerance;
     equal
 }
 
-fn stringPull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>> {
+fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>> {
     let mut points: Vec<Point2<f64>> = vec![];
     let mut portal_apex: Point2<f64> = portals[0];
     let mut portal_left: Point2<f64> = portals[0];
     let mut portal_right: Point2<f64> = portals[1];
-    let mut apex_index = 0;
+    let mut apex_index: usize;
     let mut left_index = 0;
     let mut right_index = 0;
 
@@ -604,9 +663,9 @@ fn stringPull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>>
 
     let mut i = 1;
     while (i < portals.len()) && (points.len() < max_points) {
-        i = i+1;
-        let left = portals.get(i*2); //TODO check if this is correct
-        let right = portals.get((i*2) + 1);
+        i = i + 1;
+        let left = portals.get(i * 2);
+        let right = portals.get((i * 2) + 1);
 
         let left = match left {
             Some(point) => point,
@@ -675,8 +734,7 @@ fn stringPull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>>
         points.push(portals.last().unwrap().clone());
     }
 
-    println!("Points len: {:}", points.len());
-    println!("Check if this is: {:}", (-0.0 < 0.0));
+    info!("String Pull Points len: {:}", points.len());
 
     points
 }
@@ -695,6 +753,7 @@ fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> geo_types::Polygon<
 #[launch]
 fn rocket() -> _ {
     dotenv().ok();
+    env_logger::init();
     rocket::build().mount("/", routes![index])
 }
 
