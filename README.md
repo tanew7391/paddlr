@@ -19,7 +19,9 @@ Rust, Rocket, GeoJSON
 
 
 ### Notes
-Speeding up the pathfinding could be accomplished via a bounding box before CDT. This would greatly reduce the number of triangles computed and speed up A*.
-The one caveat is that the start and end nodes could be located in two different polygons.
-Once a bounding box divides the polygons, we can check each polygon to see if it contains a point. We can also apply a filter, as the points will exist in either corners of the bounding box.
-If both points exist in one polygon, the focus polygon
+- ~~Speeding up the pathfinding could be accomplished via a bounding box before CDT. This would greatly reduce the number of triangles computed and speed up A*.  
+The one caveat is that the start and end nodes could be located in two different polygons.  
+Once a bounding box divides the polygons, we can check each polygon to see if it contains a point. We can also apply a filter, as the points will exist in either corners of the bounding box.  
+If both points exist in one polygon, the focus polygon~~
+
+- Add raytracing between points in the final line

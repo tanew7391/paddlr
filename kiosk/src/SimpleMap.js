@@ -1,13 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MapContainer, TileLayer, useMapEvents, Marker, GeoJSON, useMap } from "react-leaflet";
+import { OpenStreetMapProvider, GeoSearchControl } from 'leaflet-geosearch';
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-
-
 
 import { getRoute } from "util/api";
 import { marker_array_to_multipoint_geojson } from "util/util"
 import { MINIMUM_WAYPOINTS, STARTING_LATITUDE, STARTING_LONGITUDE } from "util/constants";
+import LoadingIndicator from "components/LoadingIndicator/LoadingIndicator";
 
 L.Marker.prototype.options.icon = L.icon({
     iconUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png"
@@ -18,32 +18,17 @@ const MapRender = () => {
     const [waypoints, setWaypoints] = useState([]);
     const [route, setRoute] = useState(null);
     const [error, setError] = useState(null);
-    const geoJsonLayer = useRef();
+    const [total_distance, setTotalDistance] = useState("0.00 km");
+    const [loading, setLoading] = useState(false);
+
+    const mapRef = useRef();
 
     const parentMap = useMap();
 
-    useMapEvents({
-        click(e) {
-            const waypoint = (
-                <Marker
-                    position={e.latlng}
-                >
-                </Marker>
-            );
-
-            setWaypoints(oldWaypoints => {
-                return [...oldWaypoints, waypoint];
-            });
-        }
+    const search = new GeoSearchControl({
+        provider: new OpenStreetMapProvider(),
+        style: 'bar',
     });
-    
-    const onClearMap = useCallback(() => {
-        setWaypoints([]);
-        setRoute(null);
-        if (geoJsonLayer.current) {
-            geoJsonLayer.current.clearLayers(); // Clear the existing layer
-        }
-    }, []);
 
     L.Control.Button = L.Control.extend({
         options: {
@@ -66,6 +51,37 @@ const MapRender = () => {
         },
     });
 
+    useEffect(() => {
+        parentMap.addControl(search);
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useMapEvents({
+        click(e) {
+            const waypoint = (
+                <Marker
+                    position={e.latlng}
+                >
+                </Marker>
+            );
+
+            setWaypoints(oldWaypoints => {
+                return [...oldWaypoints, waypoint];
+            });
+        }
+    });
+    
+    const onClearMap = useCallback(() => {
+        setWaypoints([]);
+        setRoute(null);
+        setTotalDistance("0.00 km");
+        setError(null);
+        if (mapRef.current) {
+            mapRef.current.clearLayers(); // Clear the existing layer
+        }
+    }, []);
+
     let control = useMemo(() => new L.Control.Button(), []); 
     useEffect(() => {control.addTo(parentMap)}, [control, parentMap]);;
 
@@ -73,6 +89,7 @@ const MapRender = () => {
         console.log("Waypoints changed:", waypoints);
         setError(null);
         if (waypoints.length > MINIMUM_WAYPOINTS) {
+            setLoading(true);
             getRoute(
                 marker_array_to_multipoint_geojson(waypoints)
             ).then((info) => {
@@ -80,18 +97,36 @@ const MapRender = () => {
                 setRoute(info.data);
             }).catch((err) => {
                 setError(err.message || "An error occurred while fetching the route.");
-            })
+            }).finally(() => {
+                setLoading(false);
+            });
         }
     }, [waypoints]);
 
 
 
     useEffect(() => {
-        if (geoJsonLayer.current) {
-            geoJsonLayer.current.clearLayers(); // Clear the existing layer
-            geoJsonLayer.current.addData(route); // Add the new data
+        if (mapRef.current) {
+            mapRef.current.clearLayers(); // Clear the existing layer
+            let myLayer = L.geoJSON().addTo(mapRef.current);
+            myLayer.addData(route)
+
+            let total_distance = 0;
+
+
+            route.geometries.forEach(ls => {
+                if (ls.type !== "LineString") return;
+                // Calculate the total length of the LineString
+                const latlngs = ls.coordinates.map(([lng, lat]) => L.latLng(lat, lng));
+                for (let i = 1; i < latlngs.length; i++) {
+                    total_distance += parentMap.distance(latlngs[i - 1], latlngs[i]);
+                }
+            });
+
+            setTotalDistance((total_distance / 1000).toFixed(2) + " km");
+
         }
-    }, [route]);
+    }, [parentMap, route]);
 
     return (
         <div>
@@ -117,6 +152,21 @@ const MapRender = () => {
                     {error}
                 </div>
             }
+            {loading && 
+                <div 
+                    className="leaflet-control leaflet-center "
+                    style={{
+                        position: "absolute",
+                        left: 0,
+                        right: 0,
+                    }}
+                >
+                    <LoadingIndicator />
+                </div>
+            }
+            <div className="leaflet-bottom leaflet-control" style={{ textAlign: "center", padding: "8px 16px", background: "white", borderRadius: "4px", boxShadow: "0 2px 8px rgba(0,0,0,0.15)", maxWidth: "80vw", margin: "16px auto" }}>
+                <h2>{total_distance}</h2>
+            </div>
             <span>
                 {waypoints.map((waypoint, index) => (
                     <React.Fragment key={index}>
@@ -124,7 +174,7 @@ const MapRender = () => {
                     </React.Fragment>
                 ))}
                 {
-                    route != null && <GeoJSON data={route} ref={geoJsonLayer} />
+                    route != null && <GeoJSON data={route} ref={mapRef} />
                 }
             </span>
         </div>
