@@ -5,12 +5,8 @@ export const marker_array_to_multipoint_geojson = (marker_array) => {
     });
 
     const geoJsonMultiPoint = {
-        type: "Feature",
-        geometry: {
             type: "MultiPoint",
             coordinates: coordinates
-        },
-        properties: {}
     };
 
     return geoJsonMultiPoint

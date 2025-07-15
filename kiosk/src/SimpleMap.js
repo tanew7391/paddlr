@@ -20,6 +20,7 @@ const MapRender = () => {
     const [error, setError] = useState(null);
     const [total_distance, setTotalDistance] = useState("0.00 km");
     const [loading, setLoading] = useState(false);
+    const [stopFlag, setStopFlag] = useState("Triangulation");
 
     const mapRef = useRef();
 
@@ -91,7 +92,7 @@ const MapRender = () => {
         if (waypoints.length > MINIMUM_WAYPOINTS) {
             setLoading(true);
             getRoute(
-                marker_array_to_multipoint_geojson(waypoints)
+                stopFlag, marker_array_to_multipoint_geojson(waypoints)
             ).then((info) => {
                 console.log("Setting route");
                 setRoute(info.data);
@@ -101,7 +102,7 @@ const MapRender = () => {
                 setLoading(false);
             });
         }
-    }, [waypoints]);
+    }, [stopFlag, waypoints]);
 
 
 
@@ -114,7 +115,7 @@ const MapRender = () => {
             let total_distance = 0;
 
 
-            route.geometries.forEach(ls => {
+            route.geometries?.forEach(ls => {
                 if (ls.type !== "LineString") return;
                 // Calculate the total length of the LineString
                 const latlngs = ls.coordinates.map(([lng, lat]) => L.latLng(lat, lng));
