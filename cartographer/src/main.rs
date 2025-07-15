@@ -10,14 +10,11 @@ use postgis::ewkb;
 use proj::{Proj, Transform};
 use spade::PositionInTriangulation::OnFace;
 use std::{
-    env,
-    fs::File,
-    io::{Read, Write},
-    process::{Command, Stdio},
+    env, fmt::format, fs::File, io::{Read, Write}, process::{Command, Stdio}
 };
 use tokio_postgres::{Client, NoTls};
 
-use geo::{coord, BooleanOps, Coord, HasDimensions, Intersects, Line};
+use geo::{coord, BooleanOps, BoundingRect, Coord, HasDimensions, Intersects, Line, MultiPoint};
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
@@ -27,11 +24,12 @@ use std::{collections::HashMap, error::Error, vec};
 use env_logger;
 use log::{self, debug, info, warn};
 
-use geojson::{Bbox, GeoJson, Geometry, PointType, Value};
+use geojson::{Value};
 use rocket::{
-    data::{Data, ToByteUnit},
     tokio,
+    serde::{Deserialize, json::Json},
 };
+use geojson::de::{deserialize_geometry};
 
 pub use crate::face_node::FaceNode;
 use crate::face_node::FaceNodeType;
@@ -40,14 +38,18 @@ const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 const PSEUDO_MERCATOR_CRS: &str = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs";
 const WGS_84_CRS: &str = "+proj=longlat +datum=WGS84 +no_defs +type=crs";
 
-async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Box<dyn Error>> {
+//TODO: have this take a rect
+async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
-    let bounding_box_as_string = bounding_area
-        .iter()
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let bounding_rect_as_string = format!(
+        "{}, {}, {}, {}",
+        bounding_rect.min().y,
+        bounding_rect.min().x,
+        bounding_rect.max().y,
+        bounding_rect.max().x,
+    );
+
 
     let query = format!(
         r#"
@@ -61,8 +63,10 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Bo
         );
         out meta;
         "#,
-        bounding_box_as_string, bounding_box_as_string
+        bounding_rect_as_string, bounding_rect_as_string
     );
+
+    info!("Overpass API query: {:?}", query);
 
     let res: String = client
         .post(OVERPASS_API_URL)
@@ -73,6 +77,14 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Bo
         .text()
         .await?;
 
+    if (env::var("DEBUG").is_ok() && env::var("DEBUG").unwrap() == "true")
+    {
+        let mut file = File::create("testing/osm_response.xml").unwrap();
+        file.write_all(res.as_bytes()).unwrap();
+    }
+
+
+
     if res.len() < 1000 {
         info!("Overpass API returned  {:?}", res);
     }
@@ -80,42 +92,6 @@ async fn get_associated_water_features(bounding_area: Bbox) -> Result<String, Bo
     Ok(res)
 }
 
-fn extract_bounding_box_from_multipoint_geometry(
-    multipoint_geom: &Vec<PointType>,
-) -> Result<Bbox, Box<dyn Error>> {
-    let failure_message = "Expected at least one coordinate in multipoint geometry set. Received 0";
-
-    let mut owned_multipoint_geom = multipoint_geom.to_owned();
-
-    owned_multipoint_geom.sort_by(|point_a, point_b| point_a[0].partial_cmp(&point_b[0]).unwrap());
-    let westmost_value = owned_multipoint_geom.first().expect(failure_message)[0];
-    let eastmost_value = owned_multipoint_geom.last().expect(failure_message)[0];
-
-    owned_multipoint_geom.sort_by(|point_a, point_b| point_a[1].partial_cmp(&point_b[1]).unwrap());
-    let southmost_value = owned_multipoint_geom.first().expect(failure_message)[1];
-    let northmost_value = owned_multipoint_geom.last().expect(failure_message)[1];
-
-    Ok(Bbox::from([
-        southmost_value,
-        westmost_value,
-        northmost_value,
-        eastmost_value,
-    ]))
-}
-
-fn extract_multipoint_geometry(geojson: GeoJson) -> Result<Vec<PointType>, Box<dyn Error>> {
-    if let GeoJson::Feature(feature) = geojson {
-        if let Some(Geometry {
-            value: Value::MultiPoint(multipoints),
-            ..
-        }) = feature.geometry
-        {
-            return Ok(multipoints);
-        }
-    }
-
-    Err("GeoJSON does not include a multipoint geometry".into())
-}
 
 async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
     let sql_path = env::var("SQLPATH").unwrap_or("NO PASS SET".to_string());
@@ -282,6 +258,8 @@ fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
         .stdout(Stdio::piped())
         .arg("-d")
         .arg(connection_string)
+        .arg("--append")
+        .arg("--slim")
         .arg("-r")
         .arg("xml")
         .arg("/dev/stdin")
@@ -301,20 +279,12 @@ fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
 
 async fn write_user_points_to_db(
     client: &mut Client,
-    contained_multipoint_geometry: &Vec<PointType>,
+    mut contained_multipoint_geometry: MultiPoint<f64>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut transformed_multipoint_geometry: Vec<Coord> = vec![];
 
-    for point in contained_multipoint_geometry {
-        let mut coord = Coord {
-            x: point[0],
-            y: point[1],
-        };
-        coord
-            .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
-            .expect("Failed to transform coordinate");
-        transformed_multipoint_geometry.push(coord);
-    }
+    contained_multipoint_geometry.transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+            .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
+
     let transaction = client.transaction().await?;
 
     transaction.execute("DELETE FROM points", &[]).await?;
@@ -323,9 +293,9 @@ async fn write_user_points_to_db(
         .prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))")
         .await?;
 
-    for point in transformed_multipoint_geometry {
+    for point in contained_multipoint_geometry {
         transaction
-            .execute(&prepared_statement, &[&point.x, &point.y])
+            .execute(&prepared_statement, &[&point.0.x, &point.0.y])
             .await?;
     }
     transaction.commit().await?;
@@ -333,18 +303,34 @@ async fn write_user_points_to_db(
     Ok(())
 }
 
-#[post("/api", data = "<data>")]
-async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
-    let data_string = data.open(1.megabytes()).into_string().await.unwrap();
+#[derive(Deserialize, Debug, PartialEq)]
+enum StopFlag {
+    FocusPolygon,
+    Triangulation,
+    TriangulationPathfinding,
+    FullPath,
+}
 
-    let json = data_string.parse::<GeoJson>().unwrap();
+#[derive(Deserialize, Debug)]
+struct RequestData {
+    stop_flag: StopFlag,
+    #[serde(deserialize_with = "deserialize_geometry")]
+    geometry: geo_types::MultiPoint<f64>,
+}
 
-    let contained_multipoint_geometry: Vec<PointType> = extract_multipoint_geometry(json).unwrap();
+#[post("/api", data = "<data>", format = "application/json")]
+async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> {
+    let data = data.into_inner();
 
-    let bounding_boxes: Bbox =
-        extract_bounding_box_from_multipoint_geometry(&contained_multipoint_geometry).unwrap();
+    debug!("Received data: {:?}", data);
 
-    let associated_water_features_future = get_associated_water_features(bounding_boxes);
+    let contained_multipoint_geometry = data.geometry;
+
+    let bounding_rect = contained_multipoint_geometry
+        .bounding_rect()
+        .expect("Failed to get bounding rectangle from multipoint geometry");
+
+    let associated_water_features_future = get_associated_water_features(&bounding_rect);
     //line_string_json.unwrap().to_string()
     let associated_water_features = match associated_water_features_future.await {
         Ok(features) => features,
@@ -359,14 +345,21 @@ async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
         .await
         .expect("Failed to connect to database");
 
-    write_user_points_to_db(&mut client, &contained_multipoint_geometry)
+    //Temp
+    let mut start = contained_multipoint_geometry.0.first().expect("Expected at least one coordinate in multipoint geometry set. Received 0").0;
+    let mut end = contained_multipoint_geometry.0.last().expect("Expected at least one coordinate in multipoint geometry set. Received 0").0;
+
+    write_user_points_to_db(&mut client, contained_multipoint_geometry)
         .await
         .expect("Failed to write user points to database");
 
+
+    //TODO: use rust to merge instead of SQL
     run_merging_script(&client)
         .await
         .expect("Failed to run merging script SQL");
 
+    //TODO: extract holes with rust
     let (exterior_ring, interior_rings) =
         retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(&client)
             .await
@@ -383,15 +376,12 @@ async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
     let transform_to_pseudo_mercator = Proj::new_known_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS, None)
         .expect("Failed to create transformer");
 
-    //Temp
-    let mut start = Coord {
-        x: contained_multipoint_geometry[0][0],
-        y: contained_multipoint_geometry[0][1],
-    };
-    let mut end = Coord {
-        x: contained_multipoint_geometry[1][0],
-        y: contained_multipoint_geometry[1][1],
-    };
+    if data.stop_flag == StopFlag::FocusPolygon {
+        info!("Returning focus polygon as GeoJSON");
+        focus_polygon.transform(&transform_to_wgs84).expect("Failed to reproject focus polygon");
+        let focus_polygon_geojson = Value::from(&focus_polygon).to_string();
+        return Ok(focus_polygon_geojson);
+    }
 
     start.transform(&transform_to_pseudo_mercator).unwrap();
     end.transform(&transform_to_pseudo_mercator).unwrap();
@@ -457,12 +447,42 @@ async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
 
     //End Temp
 
+    if data.stop_flag == StopFlag::Triangulation {
+        info!("Returning as GeoJSON");
+        let triangulation: geo_types::MultiPolygon<f64> = cdt.inner_faces()
+            .map(|face_handle| {
+                let face_node = FaceNode::new(face_handle);
+                let mut geom = face_to_polygon(&face_node);
+                geom.transform(&transform_to_wgs84)
+                    .expect("Failed to reproject face polygon");
+                geom
+            })
+            .collect();
+        let focus_polygon_geojson = Value::from(&triangulation).to_string();
+        return Ok(focus_polygon_geojson);
+    }
+
     let polygon_path =
         compute_a_star_pathfinding_from_delaney(start_cdt, end_cdt, &cdt, &focus_polygon);
 
     if polygon_path.is_empty() {
         info!("No path found, returning empty string");
         return Err(rocket::http::Status::NotFound);
+    }
+
+    if data.stop_flag == StopFlag::TriangulationPathfinding {
+        info!("Returning as GeoJSON");
+        let multipolygon_path: geo_types::MultiPolygon<f64> = polygon_path
+            .iter()
+            .map(|face_node| {
+                let mut geom = face_to_polygon(face_node);
+                geom.transform(&transform_to_wgs84)
+                    .expect("Failed to reproject face polygon");
+                geom
+            })
+            .collect();
+        let focus_polygon_geojson = Value::from(&multipolygon_path).to_string();
+        return Ok(focus_polygon_geojson);
     }
 
     let portals = generate_portals(&polygon_path, &start_cdt, &end_cdt);
@@ -510,12 +530,7 @@ async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
         }
     });
 
-    /*     let test: Vec<geo_types::Geometry<f64>> = polygon_path
-    .iter()
-    .map(|face_node| geo_types::Geometry::from(face_to_polygon_TEST(face_node)))
-    .collect();*/
     let mut line = geo_types::GeometryCollection::from(test);
-    //let mut focus_polygon_final = geo_types::GeometryCollection::from(focus_polygon);
 
     line.transform(&transform_to_wgs84)
         .expect("Failed to reproject geometry collection");
@@ -524,7 +539,7 @@ async fn index(data: Data<'_>) -> Result<String, rocket::http::Status> {
     Ok(info_string)
 }
 
-fn face_to_polygon_TEST(face_node: &FaceNode) -> geo_types::Polygon<f64> {
+fn face_to_polygon(face_node: &FaceNode) -> geo_types::Polygon<f64> {
     let face = face_node.get_face();
     let vertices = face.positions();
     let linestring = geo_types::LineString::from(
