@@ -1,0 +1,42 @@
+services:
+  cartographera:
+    container_name: cartographera
+    build:
+      context: ../  
+      dockerfile: deployment/Dockerfile.cartographer
+      network: host
+    ports:
+      - "8000:8000"
+    environment:
+      - RUST_LOG=${RUST_LOG:-warn}
+    env_file:
+      - ../.env
+    networks:
+      - local-net
+  postgres:
+    container_name: postgres
+    image: postgis/postgis
+    ports:
+      - "${PGPORT}:${PGPORT}"
+    env_file:
+      - ../.env
+    environment:
+      - POSTGRES_USER=${PGUSER}
+      - POSTGRES_PASSWORD=${PGPASSWORD}
+      - POSTGRES_DB=${PGDATABASE}
+    networks:
+      - local-net
+  kiosk:
+    container_name: kiosk
+    build:
+      context: ../
+      dockerfile: deployment/Dockerfile.kiosk
+      network: host
+    ports:
+     - "3000:3000"
+    networks:
+      - local-net
+
+networks:
+  local-net:
+    driver: bridge
