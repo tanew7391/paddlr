@@ -8,6 +8,9 @@ import { getRoute } from "util/api";
 import { marker_array_to_multipoint_geojson } from "util/util"
 import { MINIMUM_WAYPOINTS, STARTING_LATITUDE, STARTING_LONGITUDE } from "util/constants";
 import LoadingIndicator from "components/LoadingIndicator/LoadingIndicator";
+import Dropdown from "components/Dropdown/Dropdown";
+import Control from "react-leaflet-custom-control";
+import Button from "components/Button/Button";
 
 L.Marker.prototype.options.icon = L.icon({
     iconUrl: "https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon.png"
@@ -20,7 +23,7 @@ const MapRender = () => {
     const [error, setError] = useState(null);
     const [total_distance, setTotalDistance] = useState("0.00 km");
     const [loading, setLoading] = useState(false);
-    const [stopFlag, setStopFlag] = useState("Triangulation");
+    const [stopFlag, setStopFlag] = useState("FullPath");
 
     const mapRef = useRef();
 
@@ -31,27 +34,15 @@ const MapRender = () => {
         style: 'bar',
     });
 
-    L.Control.Button = L.Control.extend({
-        options: {
-            position: 'topleft'
-        },
-        onAdd: (map) => {
-            var container = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
-            var button = L.DomUtil.create('a', 'leaflet-control-button', container);
-            button.innerHTML = '<img src="https://icons.getbootstrap.com/assets/icons/trash.svg" style="width:16px; padding-top: 7px;"/>';
-            L.DomEvent.disableClickPropagation(button);
-            L.DomEvent.on(button, 'click', function(e){
-                onClearMap()
-            });
+    const flagOptions = [
+        { value: "FullPath", label: "Full Path" },
+        { value: "Triangulation", label: "Triangulation" },
+        { value: "FocusPolygon", label: "Area of Interest" },
+        { value: "TriangulationPathfinding", label: "Path Through Triangulation" },
+        { value: "ProcessedFaces", label: "Processed Faces" },
+    ]
 
-            container.title = "Clear Map";
-
-            return container;
-        },
-        onRemove: (map) => {
-        },
-    });
-
+    
     useEffect(() => {
         parentMap.addControl(search);
 
@@ -82,9 +73,6 @@ const MapRender = () => {
             mapRef.current.clearLayers(); // Clear the existing layer
         }
     }, []);
-
-    let control = useMemo(() => new L.Control.Button(), []); 
-    useEffect(() => {control.addTo(parentMap)}, [control, parentMap]);;
 
     useEffect(() => {
         console.log("Waypoints changed:", waypoints);
@@ -131,6 +119,14 @@ const MapRender = () => {
 
     return (
         <div>
+            <Control position='topleft'>
+                    <div style={{ display: "flex", flexDirection: "column"}}>
+                        <Button onClick={onClearMap} disabled={loading}>
+                            <img alt="clear map" src="https://icons.getbootstrap.com/assets/icons/trash.svg"/>
+                        </Button>
+                        <Dropdown setFlag={setStopFlag} selectedFlag={stopFlag} options={flagOptions}/>
+                    </div>
+            </Control>
             {error && 
                 <div 
                     className="leaflet-center leaflet-control"
@@ -165,6 +161,7 @@ const MapRender = () => {
                     <LoadingIndicator />
                 </div>
             }
+
             <div className="leaflet-bottom leaflet-control" style={{ textAlign: "center", padding: "8px 16px", background: "white", borderRadius: "4px", boxShadow: "0 2px 8px rgba(0,0,0,0.15)", maxWidth: "80vw", margin: "16px auto" }}>
                 <h2>{total_distance}</h2>
             </div>

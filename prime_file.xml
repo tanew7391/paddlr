@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="Overpass API 0.7.62.8 e802775f">
+<note>The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.</note>
+<meta osm_base="2025-10-05T19:53:30Z"/>
+
+  <node id="3415140584" lat="48.3415961" lon="34.0656512" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140585" lat="48.3416317" lon="34.0655053" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140586" lat="48.3416489" lon="34.0658423" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140587" lat="48.3417345" lon="34.0658809" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140588" lat="48.3417530" lon="34.0654087" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140589" lat="48.3418272" lon="34.0658401" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140590" lat="48.3419257" lon="34.0659282" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140591" lat="48.3419457" lon="34.0653464" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415140592" lat="48.3420298" lon="34.0660097" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146093" lat="48.3421668" lon="34.0660570" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146094" lat="48.3422296" lon="34.0661514" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146095" lat="48.3422881" lon="34.0652455" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146096" lat="48.3422895" lon="34.0663790" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146097" lat="48.3423209" lon="34.0667997" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146098" lat="48.3424122" lon="34.0673020" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146099" lat="48.3424750" lon="34.0652283" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146100" lat="48.3425863" lon="34.0682337" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146101" lat="48.3426534" lon="34.0652047" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146102" lat="48.3426719" lon="34.0688519" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146103" lat="48.3426890" lon="34.0676627" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146104" lat="48.3427062" lon="34.0650459" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146105" lat="48.3427318" lon="34.0685643" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146106" lat="48.3427661" lon="34.0670916" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146107" lat="48.3428018" lon="34.0647046" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146108" lat="48.3428105" lon="34.0664966" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146109" lat="48.3428428" lon="34.0661779" version="1" timestamp="2015-03-23T22:27:33Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146111" lat="48.3429644" lon="34.0640992" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146112" lat="48.3430457" lon="34.0636398" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146114" lat="48.3430943" lon="34.0632577" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146115" lat="48.3431856" lon="34.0630688" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146116" lat="48.3432605" lon="34.0658834" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146117" lat="48.3432698" lon="34.0628262" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146118" lat="48.3432926" lon="34.0626674" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146119" lat="48.3433126" lon="34.0623754" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146120" lat="48.3433997" lon="34.0657012" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146121" lat="48.3434153" lon="34.0619869" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146122" lat="48.3434320" lon="34.0654766" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146123" lat="48.3434521" lon="34.0651396" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146124" lat="48.3434638" lon="34.0615318" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146125" lat="48.3434852" lon="34.0613493" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146126" lat="48.3435107" lon="34.0649696" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146127" lat="48.3435252" lon="34.0612055" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146128" lat="48.3435772" lon="34.0610564" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146129" lat="48.3436398" lon="34.0649180" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146131" lat="48.3437992" lon="34.0609775" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146132" lat="48.3439405" lon="34.0643837" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146133" lat="48.3439505" lon="34.0610291" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146136" lat="48.3441604" lon="34.0637704" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146140" lat="48.3443279" lon="34.0632786" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146143" lat="48.3444651" lon="34.0614086" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146145" lat="48.3446568" lon="34.0627079" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146146" lat="48.3447738" lon="34.0625318" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146149" lat="48.3448686" lon="34.0618245" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146150" lat="48.3448908" lon="34.0624468" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146151" lat="48.3449453" lon="34.0619914" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <node id="3415146152" lat="48.3449736" lon="34.0622191" version="1" timestamp="2015-03-23T22:27:34Z" changeset="29690686" uid="373695" user="algot"/>
+  <way id="334416509" version="1" timestamp="2015-03-23T22:27:35Z" changeset="29690686" uid="373695" user="algot">
+    <nd ref="3415146128"/>
+    <nd ref="3415146131"/>
+    <nd ref="3415146133"/>
+    <nd ref="3415146143"/>
+    <nd ref="3415146149"/>
+    <nd ref="3415146151"/>
+    <nd ref="3415146152"/>
+    <nd ref="3415146150"/>
+    <nd ref="3415146146"/>
+    <nd ref="3415146145"/>
+    <nd ref="3415146140"/>
+    <nd ref="3415146136"/>
+    <nd ref="3415146132"/>
+    <nd ref="3415146129"/>
+    <nd ref="3415146126"/>
+    <nd ref="3415146123"/>
+    <nd ref="3415146122"/>
+    <nd ref="3415146120"/>
+    <nd ref="3415146116"/>
+    <nd ref="3415146109"/>
+    <nd ref="3415146108"/>
+    <nd ref="3415146106"/>
+    <nd ref="3415146103"/>
+    <nd ref="3415146105"/>
+    <nd ref="3415146102"/>
+    <nd ref="3415146100"/>
+    <nd ref="3415146098"/>
+    <nd ref="3415146097"/>
+    <nd ref="3415146096"/>
+    <nd ref="3415146094"/>
+    <nd ref="3415146093"/>
+    <nd ref="3415140592"/>
+    <nd ref="3415140590"/>
+    <nd ref="3415140589"/>
+    <nd ref="3415140587"/>
+    <nd ref="3415140586"/>
+    <nd ref="3415140584"/>
+    <nd ref="3415140585"/>
+    <nd ref="3415140588"/>
+    <nd ref="3415140591"/>
+    <nd ref="3415146095"/>
+    <nd ref="3415146099"/>
+    <nd ref="3415146101"/>
+    <nd ref="3415146104"/>
+    <nd ref="3415146107"/>
+    <nd ref="3415146111"/>
+    <nd ref="3415146112"/>
+    <nd ref="3415146114"/>
+    <nd ref="3415146115"/>
+    <nd ref="3415146117"/>
+    <nd ref="3415146118"/>
+    <nd ref="3415146119"/>
+    <nd ref="3415146121"/>
+    <nd ref="3415146124"/>
+    <nd ref="3415146125"/>
+    <nd ref="3415146127"/>
+    <nd ref="3415146128"/>
+    <tag k="natural" v="water"/>
+  </way>
+
+</osm>
