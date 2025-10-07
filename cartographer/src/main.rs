@@ -10,7 +10,10 @@ use postgis::ewkb;
 use proj::{Proj, Transform};
 use spade::PositionInTriangulation::OnFace;
 use std::{
-    env, fmt::format, fs::File, io::{Read, Write}, process::{Command, Stdio}
+    env,
+    fs::File,
+    io::{Read, Write},
+    process::{Command, Stdio},
 };
 use tokio_postgres::{Client, NoTls};
 
@@ -24,12 +27,12 @@ use std::{collections::HashMap, error::Error, vec};
 use env_logger;
 use log::{self, debug, info, warn};
 
-use geojson::{Value};
+use geojson::de::deserialize_geometry;
+use geojson::Value;
 use rocket::{
+    serde::{json::Json, Deserialize},
     tokio,
-    serde::{Deserialize, json::Json},
 };
-use geojson::de::{deserialize_geometry};
 
 pub use crate::face_node::FaceNode;
 use crate::face_node::FaceNodeType;
@@ -47,7 +50,9 @@ struct ConnectionParams {
 }
 
 //TODO: have this take a rect
-async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Result<String, Box<dyn Error>> {
+async fn get_associated_water_features(
+    bounding_rect: &geo_types::Rect,
+) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_rect_as_string = format!(
@@ -57,7 +62,6 @@ async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Resul
         bounding_rect.max().y,
         bounding_rect.max().x,
     );
-
 
     let query = format!(
         r#"
@@ -85,29 +89,16 @@ async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Resul
         .text()
         .await?;
 
-    if env::var("DEBUG").is_ok() && env::var("DEBUG").unwrap() == "true"
-    {
+    if env::var("DEBUG").is_ok() && env::var("DEBUG").unwrap() == "true" {
         let mut file = File::create("testing/osm_response.xml").unwrap();
         file.write_all(res.as_bytes()).unwrap();
     }
-
-
 
     if res.len() < 1000 {
         info!("Overpass API returned  {:?}", res);
     }
 
     Ok(res)
-}
-
-
-async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
-    let sql_path = env::var("SQLPATH").unwrap_or("NO PATH SET".to_string());
-    let mut buf = String::new();
-    File::open(sql_path)?.read_to_string(&mut buf)?;
-    client.batch_execute(&buf).await?;
-
-    Ok(())
 }
 
 async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>> {
@@ -118,7 +109,7 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
         password,
         port,
     } = get_connection_params();
-    
+
     let connection_attempt = tokio_postgres::connect(
         &format!(
             "host={} port={} user={} password={} dbname={}",
@@ -135,7 +126,6 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
             return Err(e.into());
         }
     };
-
 
     // The connection object performs the actual communication with the database,
     // so spawn it off to run on its own.
@@ -171,6 +161,73 @@ async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon
     };
 
     Ok(focus_polygon)
+}
+
+async fn retrieve_associated_faces_from_db(
+    client: &Client,
+    mut points: MultiPoint<f64>,
+) -> Result<Vec<geo_types::Polygon<f64>>, Box<dyn Error>> {
+    points
+        .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+        .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
+
+    let mut values = Vec::new();
+    let mut params = Vec::new();
+    const COLUMN_NAME: &str = "unioned_geom";
+
+    for (i, p) in points.0.iter().enumerate() {
+        let x_param = format!("${}", i * 2 + 1);
+        let y_param = format!("${}", i * 2 + 2);
+        values.push(format!(
+            "({}::double precision, {}::double precision)",
+            x_param, y_param
+        ));
+        params.push(p.x());
+        params.push(p.y());
+    }
+
+    let query = format!(
+        r#"
+    WITH input_points AS (
+    SELECT ST_MakePoint(x, y) AS geom
+    FROM (VALUES {values}) AS v(x, y)
+    ),
+    envelope AS (
+    SELECT ST_Extent(geom)::geometry AS geom
+    FROM input_points
+    )
+    SELECT ST_UnaryUnion(way) AS {COLUMN_NAME}
+    FROM planet_osm_polygon, envelope
+    WHERE "natural" = 'water'
+    AND way && envelope.geom;
+    "#,
+        values = values.join(", "),
+    );
+
+    let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|v| v as _).collect();
+
+    let rows = client.query(&query, &param_refs).await;
+
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("Error retrieving rows: {:}", e);
+            return Err(e.into());
+        }
+    };
+
+    let mut faces: Vec<geo_types::Polygon<f64>> = Vec::new();
+    for row in &rows {
+        let polygon: ewkb::Polygon = row.get(COLUMN_NAME);
+        let face = Option::from_postgis(&polygon);
+        if let Some(face) = face {
+            faces.push(face);
+        } else {
+            warn!("Face is None for row: {:?}", row);
+        }
+    }
+    Ok(faces)
 }
 
 async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
@@ -267,7 +324,6 @@ fn get_connection_params() -> ConnectionParams {
 }
 
 fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
-
     let ConnectionParams {
         host,
         database,
@@ -307,39 +363,13 @@ fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn write_user_points_to_db(
-    client: &mut Client,
-    mut contained_multipoint_geometry: MultiPoint<f64>,
-) -> Result<(), Box<dyn Error>> {
-
-    contained_multipoint_geometry.transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
-            .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
-
-    let transaction = client.transaction().await?;
-
-    transaction.execute("DELETE FROM points", &[]).await?;
-
-    let prepared_statement = transaction
-        .prepare("insert into points (wkb_geometry) values (ST_MakePoint($1, $2))")
-        .await?;
-
-    for point in contained_multipoint_geometry {
-        transaction
-            .execute(&prepared_statement, &[&point.0.x, &point.0.y])
-            .await?;
-    }
-    transaction.commit().await?;
-
-    Ok(())
-}
-
 #[derive(Deserialize, Debug, PartialEq)]
 enum StopFlag {
     FocusPolygon,
     Triangulation,
     TriangulationPathfinding,
     FullPath,
-    ProcessedFaces
+    ProcessedFaces,
 }
 
 #[derive(Deserialize, Debug)]
@@ -372,22 +402,26 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     write_osm_to_database(associated_water_features).expect("Failed to write OSM data to database");
 
-    let mut client = get_connected_client()
+    let client = get_connected_client()
         .await
         .expect("Failed to connect to database");
 
     //Temp
-    let mut start = contained_multipoint_geometry.0.first().expect("Expected at least one coordinate in multipoint geometry set. Received 0").0;
-    let mut end = contained_multipoint_geometry.0.last().expect("Expected at least one coordinate in multipoint geometry set. Received 0").0;
-
-    write_user_points_to_db(&mut client, contained_multipoint_geometry)
-        .await
-        .expect("Failed to write user points to database");
+    let mut start = contained_multipoint_geometry
+        .0
+        .first()
+        .expect("Expected at least one coordinate in multipoint geometry set. Received 0")
+        .0;
+    let mut end = contained_multipoint_geometry
+        .0
+        .last()
+        .expect("Expected at least one coordinate in multipoint geometry set. Received 0")
+        .0;
 
     //TODO: use rust to merge instead of SQL
-    run_merging_script(&client)
+    let faces = retrieve_associated_faces_from_db(&client, contained_multipoint_geometry)
         .await
-        .expect("Failed to run merging script SQL");
+        .expect("Failed to retrieve associated faces from database");
 
     //TODO: extract holes with rust
     let (exterior_ring, interior_rings) =
@@ -408,7 +442,9 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     if data.stop_flag == StopFlag::FocusPolygon {
         info!("Returning focus polygon as GeoJSON");
-        focus_polygon.transform(&transform_to_wgs84).expect("Failed to reproject focus polygon");
+        focus_polygon
+            .transform(&transform_to_wgs84)
+            .expect("Failed to reproject focus polygon");
         let focus_polygon_geojson = Value::from(&focus_polygon).to_string();
         return Ok(focus_polygon_geojson);
     }
@@ -479,7 +515,8 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     if data.stop_flag == StopFlag::Triangulation {
         info!("Returning as GeoJSON");
-        let triangulation: geo_types::MultiPolygon<f64> = cdt.inner_faces()
+        let triangulation: geo_types::MultiPolygon<f64> = cdt
+            .inner_faces()
             .map(|face_handle| {
                 let face_node = FaceNode::new(face_handle);
                 let mut geom = face_to_polygon(&face_node);
@@ -492,8 +529,13 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         return Ok(focus_polygon_geojson);
     }
 
-    let polygon_path =
-        compute_a_star_pathfinding_from_delaney(start_cdt, end_cdt, &cdt, &focus_polygon, data.stop_flag == StopFlag::ProcessedFaces);
+    let polygon_path = compute_a_star_pathfinding_from_delaney(
+        start_cdt,
+        end_cdt,
+        &cdt,
+        &focus_polygon,
+        data.stop_flag == StopFlag::ProcessedFaces,
+    );
 
     if data.stop_flag == StopFlag::ProcessedFaces {
         info!("Returning processed faces as GeoJSON");
@@ -604,7 +646,6 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     focus_polygon: &geo_types::Polygon<f64>,
     return_processed_faces: bool,
 ) -> Vec<FaceNode<'a>> {
-
     let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
     let position_in_triangulation = cdt.locate(start);
 
@@ -645,7 +686,7 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     let success_fn = |face_node: &FaceNode| face_node.eq(&end_face_node);
 
     let a_star_results = astar(&start_face_node, sucessors_fn, heuristic_fn, success_fn);
-    
+
     if return_processed_faces {
         let mut processed_faces: Vec<FaceNode> = vec![];
         for face in cdt.inner_faces() {
@@ -656,7 +697,7 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
         }
         return processed_faces;
     }
-    
+
     let a_star_results = match a_star_results {
         Some((path, _cost)) => path,
         None => {
@@ -677,7 +718,11 @@ fn triangle_area_2(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f32 {
     cross_product as f32
 }
 
-fn generate_portals(face_nodes: &Vec<FaceNode>, start_node: &Point2<f64>, end_node: &Point2<f64>) -> Vec<Point2<f64>> {
+fn generate_portals(
+    face_nodes: &Vec<FaceNode>,
+    start_node: &Point2<f64>,
+    end_node: &Point2<f64>,
+) -> Vec<Point2<f64>> {
     let mut portals: Vec<Point2<f64>> = Vec::new();
     portals.push(start_node.clone());
     portals.push(start_node.clone());
@@ -705,7 +750,6 @@ fn generate_portals(face_nodes: &Vec<FaceNode>, start_node: &Point2<f64>, end_no
 
     portals.push(end_node.clone());
     portals.push(end_node.clone());
-
 
     portals
 }
