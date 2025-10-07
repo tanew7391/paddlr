@@ -1,6 +1,6 @@
 services:
-  cartographera:
-    container_name: cartographera
+  cartographer:
+    container_name: cartographer
     build:
       context: ../  
       dockerfile: deployment/Dockerfile.cartographer

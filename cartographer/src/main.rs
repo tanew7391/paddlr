@@ -38,6 +38,14 @@ const OVERPASS_API_URL: &str = "https://overpass-api.de/api/interpreter";
 const PSEUDO_MERCATOR_CRS: &str = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs";
 const WGS_84_CRS: &str = "+proj=longlat +datum=WGS84 +no_defs +type=crs";
 
+struct ConnectionParams {
+    host: String,
+    database: String,
+    user: String,
+    password: String,
+    port: String,
+}
+
 //TODO: have this take a rect
 async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
@@ -77,7 +85,7 @@ async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Resul
         .text()
         .await?;
 
-    if (env::var("DEBUG").is_ok() && env::var("DEBUG").unwrap() == "true")
+    if env::var("DEBUG").is_ok() && env::var("DEBUG").unwrap() == "true"
     {
         let mut file = File::create("testing/osm_response.xml").unwrap();
         file.write_all(res.as_bytes()).unwrap();
@@ -94,7 +102,7 @@ async fn get_associated_water_features(bounding_rect: &geo_types::Rect) -> Resul
 
 
 async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
-    let sql_path = env::var("SQLPATH").unwrap_or("NO PASS SET".to_string());
+    let sql_path = env::var("SQLPATH").unwrap_or("NO PATH SET".to_string());
     let mut buf = String::new();
     File::open(sql_path)?.read_to_string(&mut buf)?;
     client.batch_execute(&buf).await?;
@@ -103,10 +111,18 @@ async fn run_merging_script(client: &Client) -> Result<(), Box<dyn Error>> {
 }
 
 async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>> {
+    let ConnectionParams {
+        host,
+        database,
+        user,
+        password,
+        port,
+    } = get_connection_params();
+    
     let connection_attempt = tokio_postgres::connect(
         &format!(
-            "host=localhost port=5432 user=postgres password={} dbname=gisdb",
-            env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string())
+            "host={} port={} user={} password={} dbname={}",
+            host, port, user, password, database
         ),
         NoTls,
     )
@@ -240,21 +256,35 @@ fn simplify_search_area(
     return None;
 }
 
+fn get_connection_params() -> ConnectionParams {
+    ConnectionParams {
+        host: env::var("PGHOST").unwrap_or("localhost".to_string()),
+        database: env::var("PGDATABASE").unwrap_or("database".to_string()),
+        user: env::var("PGUSER").unwrap_or("user".to_string()),
+        password: env::var("PGPASSWORD").unwrap_or("NO PASS SET".to_string()),
+        port: env::var("PGPORT").unwrap_or("5432".to_string()),
+    }
+}
+
 fn write_osm_to_database(osm_data: String) -> Result<(), Box<dyn Error>> {
-    let host = env::var("PGHOST")?;
-    let database = env::var("PGDATABASE")?;
-    let user = env::var("PGUSER")?;
-    let password = env::var("PGPASSWORD")?;
-    let port = env::var("PGPORT")?;
+
+    let ConnectionParams {
+        host,
+        database,
+        user,
+        password,
+        port,
+    } = get_connection_params();
 
     let connection_string = format!(
         "postgresql://{}:{}@{}:{}/{}",
         user, password, host, port, database
     );
 
+    info!("Connection string: {}", connection_string);
+
     let mut command = Command::new("osm2pgsql")
         .stdin(Stdio::piped())
-        //todo this may break, test
         .stdout(Stdio::piped())
         .arg("-d")
         .arg(connection_string)
@@ -309,6 +339,7 @@ enum StopFlag {
     Triangulation,
     TriangulationPathfinding,
     FullPath,
+    ProcessedFaces
 }
 
 #[derive(Deserialize, Debug)]
@@ -352,7 +383,6 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     write_user_points_to_db(&mut client, contained_multipoint_geometry)
         .await
         .expect("Failed to write user points to database");
-
 
     //TODO: use rust to merge instead of SQL
     run_merging_script(&client)
@@ -463,15 +493,10 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     }
 
     let polygon_path =
-        compute_a_star_pathfinding_from_delaney(start_cdt, end_cdt, &cdt, &focus_polygon);
+        compute_a_star_pathfinding_from_delaney(start_cdt, end_cdt, &cdt, &focus_polygon, data.stop_flag == StopFlag::ProcessedFaces);
 
-    if polygon_path.is_empty() {
-        info!("No path found, returning empty string");
-        return Err(rocket::http::Status::NotFound);
-    }
-
-    if data.stop_flag == StopFlag::TriangulationPathfinding {
-        info!("Returning as GeoJSON");
+    if data.stop_flag == StopFlag::ProcessedFaces {
+        info!("Returning processed faces as GeoJSON");
         let multipolygon_path: geo_types::MultiPolygon<f64> = polygon_path
             .iter()
             .map(|face_node| {
@@ -481,8 +506,28 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
                 geom
             })
             .collect();
-        let focus_polygon_geojson = Value::from(&multipolygon_path).to_string();
-        return Ok(focus_polygon_geojson);
+        let processed_faces_geojson = Value::from(&multipolygon_path).to_string();
+        return Ok(processed_faces_geojson);
+    }
+
+    if polygon_path.is_empty() {
+        info!("No path found, returning empty string");
+        return Err(rocket::http::Status::NotFound);
+    }
+
+    if data.stop_flag == StopFlag::TriangulationPathfinding {
+        info!("Returning triangulation path as GeoJSON");
+        let multipolygon_path: geo_types::MultiPolygon<f64> = polygon_path
+            .iter()
+            .map(|face_node| {
+                let mut geom = face_to_polygon(face_node);
+                geom.transform(&transform_to_wgs84)
+                    .expect("Failed to reproject face polygon");
+                geom
+            })
+            .collect();
+        let triangulation_geojson = Value::from(&multipolygon_path).to_string();
+        return Ok(triangulation_geojson);
     }
 
     let portals = generate_portals(&polygon_path, &start_cdt, &end_cdt);
@@ -557,18 +602,14 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     end: Point2<f64>,
     cdt: &'a ConstrainedDelaunayTriangulation<Point2<f64>>,
     focus_polygon: &geo_types::Polygon<f64>,
+    return_processed_faces: bool,
 ) -> Vec<FaceNode<'a>> {
-    //This should return a vector of faces from cdt
-    // Implement A* algorithm here using the CDT
-    // This is a placeholder implementation
 
     let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
-    //let start_transformed = start.transform(&transformer).unwrap();
-    info!("Start transformed: {:?}", start);
     let position_in_triangulation = cdt.locate(start);
 
     //Todo: test if a start or end point is on a vertex or an edge
-    let mut start_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
+    let start_face_handle: Option<FixedFaceHandle<InnerTag>>;
     if let OnFace(face_handle) = position_in_triangulation {
         info!("On face: {:?}", face_handle.index());
         start_face_handle = Some(face_handle);
@@ -579,13 +620,14 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
 
     //Todo compress this into a single function
     let position_in_triangulation = cdt.locate(end);
-    let mut end_face_handle: Option<FixedFaceHandle<InnerTag>> = None;
+    let end_face_handle: Option<FixedFaceHandle<InnerTag>>;
     if let OnFace(face_handle) = position_in_triangulation {
         info!("On face: {:?}", face_handle.index());
         end_face_handle = Some(face_handle);
     } else {
         info!("Not on face, {:?}", position_in_triangulation);
         panic!("Start point is not on a face, no way to handle this yet");
+        //TODO handle by assigning the face to one of the adjacent faces to this point, it should be on a line if not a face
     }
 
     let start_face_center_vertex = cdt.face(start_face_handle.unwrap());
@@ -603,6 +645,18 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
     let success_fn = |face_node: &FaceNode| face_node.eq(&end_face_node);
 
     let a_star_results = astar(&start_face_node, sucessors_fn, heuristic_fn, success_fn);
+    
+    if return_processed_faces {
+        let mut processed_faces: Vec<FaceNode> = vec![];
+        for face in cdt.inner_faces() {
+            if processed_face_indices.contains_key(&face.index()) {
+                let face_node = FaceNode::new(face);
+                processed_faces.push(face_node);
+            }
+        }
+        return processed_faces;
+    }
+    
     let a_star_results = match a_star_results {
         Some((path, _cost)) => path,
         None => {
