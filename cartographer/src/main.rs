@@ -138,8 +138,31 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
     Ok(client)
 }
 
-async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon, Box<dyn Error>> {
-    let rows = client.query("SELECT polygon FROM focus_polygon", &[]).await;
+async fn get_focus_polygon_from_db(
+    client: &Client,
+    mut point: geo::Point<f64>,
+) -> Result<geo_types::Polygon, Box<dyn Error>> {
+    const COLUMN_NAME: &str = "way";
+
+    point
+        .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+        .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
+
+    let statement = format!(
+        r#"
+    SELECT {}
+    FROM planet_osm_polygon
+    WHERE "natural" = 'water'
+    AND ST_Contains(
+            way, 
+            ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 3857)
+        )
+    LIMIT 1;
+    "#,
+        COLUMN_NAME
+    );
+
+    let rows = client.query(&statement, &[&point.x(), &point.y()]).await;
 
     let rows = match rows {
         Ok(rows) => rows,
@@ -149,7 +172,9 @@ async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon
         }
     };
 
-    let polygon: ewkb::Polygon = rows[0].get("polygon");
+    debug!("Rows: {:?}", rows);
+
+    let polygon: ewkb::Polygon = rows[0].get(COLUMN_NAME);
     let focus_polygon = Option::from_postgis(&polygon);
 
     let focus_polygon = match focus_polygon {
@@ -166,7 +191,7 @@ async fn get_focus_polygon_from_db(client: &Client) -> Result<geo_types::Polygon
 async fn retrieve_associated_faces_from_db(
     client: &Client,
     mut points: MultiPoint<f64>,
-) -> Result<Vec<geo_types::Polygon<f64>>, Box<dyn Error>> {
+) -> Result<geo_types::MultiPolygon<f64>, Box<dyn Error>> {
     points
         .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
         .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
@@ -196,7 +221,7 @@ async fn retrieve_associated_faces_from_db(
     SELECT ST_Extent(geom)::geometry AS geom
     FROM input_points
     )
-    SELECT ST_UnaryUnion(way) AS {COLUMN_NAME}
+    SELECT ST_UnaryUnion(ST_Collect(way)) AS {COLUMN_NAME}
     FROM planet_osm_polygon, envelope
     WHERE "natural" = 'water'
     AND way && envelope.geom;
@@ -217,17 +242,27 @@ async fn retrieve_associated_faces_from_db(
         }
     };
 
-    let mut faces: Vec<geo_types::Polygon<f64>> = Vec::new();
-    for row in &rows {
-        let polygon: ewkb::Polygon = row.get(COLUMN_NAME);
-        let face = Option::from_postgis(&polygon);
-        if let Some(face) = face {
-            faces.push(face);
-        } else {
-            warn!("Face is None for row: {:?}", row);
+    let geometry: ewkb::Geometry = rows[0].get(COLUMN_NAME);
+    let geometry: Option<geo::Geometry<f64>> = Option::from_postgis(&geometry);
+
+    let geomtry = match geometry {
+        Some(geom) => geom,
+        None => {
+            warn!("No geometry found in database response: {:?}", rows[0]);
+            return Err("No geometry found in database response".into());
         }
-    }
-    Ok(faces)
+    };
+
+    let multi_polygon = match geomtry {
+        geo::Geometry::MultiPolygon(mp) => mp,
+        geo::Geometry::Polygon(p) => geo_types::MultiPolygon(vec![p]),
+        _ => {
+            warn!("Geometry is not a multipolygon: {:?}", geomtry);
+            return Err("Geometry is not a multipolygon".into());
+        }
+    };
+
+    Ok(multi_polygon)
 }
 
 async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
@@ -370,6 +405,7 @@ enum StopFlag {
     TriangulationPathfinding,
     FullPath,
     ProcessedFaces,
+    StudyArea,
 }
 
 #[derive(Deserialize, Debug)]
@@ -407,19 +443,23 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         .expect("Failed to connect to database");
 
     //Temp
-    let mut start = contained_multipoint_geometry
+    let start = contained_multipoint_geometry
         .0
         .first()
-        .expect("Expected at least one coordinate in multipoint geometry set. Received 0")
-        .0;
-    let mut end = contained_multipoint_geometry
+        .expect("Expected at least one coordinate in multipoint geometry set. Received 0");
+    let end = contained_multipoint_geometry
         .0
         .last()
-        .expect("Expected at least one coordinate in multipoint geometry set. Received 0")
-        .0;
+        .expect("Expected at least one coordinate in multipoint geometry set. Received 0");
 
-    //TODO: use rust to merge instead of SQL
-    let faces = retrieve_associated_faces_from_db(&client, contained_multipoint_geometry)
+    let mut start_coord = start.0;
+    let mut end_coord = end.0;
+
+    let mut focus_polygon = get_focus_polygon_from_db(&client, start.clone())
+        .await
+        .expect("Failed to retrieve focus polygon");
+
+    let mut study_area = retrieve_associated_faces_from_db(&client, contained_multipoint_geometry)
         .await
         .expect("Failed to retrieve associated faces from database");
 
@@ -429,16 +469,22 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
             .await
             .expect("Failed to retrieve exterior and interior rings");
 
-    let mut focus_polygon = get_focus_polygon_from_db(&client)
-        .await
-        .expect("Failed to retrieve focus polygon");
-
     //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
     let transform_to_wgs84 = Proj::new_known_crs(PSEUDO_MERCATOR_CRS, WGS_84_CRS, None)
         .expect("Failed to create transformer");
 
     let transform_to_pseudo_mercator = Proj::new_known_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS, None)
         .expect("Failed to create transformer");
+
+    if data.stop_flag == StopFlag::StudyArea {
+        info!("Returning study area as GeoJSON");
+
+        study_area
+            .transform(&transform_to_wgs84)
+            .expect("Failed to reproject focus polygon");
+        let focus_polygon_geojson = Value::from(&study_area).to_string();
+        return Ok(focus_polygon_geojson);
+    }
 
     if data.stop_flag == StopFlag::FocusPolygon {
         info!("Returning focus polygon as GeoJSON");
@@ -449,13 +495,15 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         return Ok(focus_polygon_geojson);
     }
 
-    start.transform(&transform_to_pseudo_mercator).unwrap();
-    end.transform(&transform_to_pseudo_mercator).unwrap();
+    start_coord
+        .transform(&transform_to_pseudo_mercator)
+        .unwrap();
+    end_coord.transform(&transform_to_pseudo_mercator).unwrap();
 
     //TODO combine with interior rings
     //TODO check when we should actually simplify the search area (what number of points is too few?)
     if focus_polygon.exterior().points().len() > 1000 {
-        let new_search_area = simplify_search_area(start, end, &focus_polygon);
+        let new_search_area = simplify_search_area(start_coord, end_coord, &focus_polygon);
         if let Some(new_polygon) = new_search_area {
             // Use the new polygon for pathfinding
             focus_polygon = new_polygon;
@@ -503,8 +551,8 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     info!("Number of Faces: {:}", cdt.num_all_faces());
     info!("Number of Inner Faces: {:}", cdt.num_inner_faces());
 
-    let start_cdt = Point2::new(start.x, start.y);
-    let end_cdt = Point2::new(end.x, end.y);
+    let start_cdt = Point2::new(start_coord.x, start_coord.y);
+    let end_cdt = Point2::new(end_coord.x, end_coord.y);
 
     info!(
         "Focus Polygon Verticies: {:?}",
