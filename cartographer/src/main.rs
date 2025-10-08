@@ -12,7 +12,7 @@ use spade::PositionInTriangulation::OnFace;
 use std::{
     env,
     fs::File,
-    io::{Read, Write},
+    io::{Write},
     process::{Command, Stdio},
 };
 use tokio_postgres::{Client, NoTls};
@@ -265,57 +265,10 @@ async fn retrieve_associated_faces_from_db(
     Ok(multi_polygon)
 }
 
-async fn retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(
-    client: &Client,
-) -> Result<(geo_types::Polygon, Vec<geo_types::Polygon<f64>>), Box<dyn Error>> {
-    let rows = client
-        .query("SELECT geom FROM holes WHERE path[1] = 0", &[])
-        .await;
-
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("Error retrieving rows: {:}", e);
-            return Err(e.into());
-        }
-    };
-
-    //TODO: strange error coming from here
-    let polygon: ewkb::Polygon = rows[0].get("geom");
-    let exterior_ring = Option::from_postgis(&polygon);
-
-    let exterior_ring = match exterior_ring {
-        Some(ring) => ring,
-        None => {
-            warn!("Could not find exterior ring! Rows[0]: {:?}", rows[0]);
-            return Err("No exterior ring found for study area!".into());
-        }
-    };
-
-    //TODO: Condense this into a single query
-    let rows = client
-        .query("SELECT geom FROM holes WHERE path[1] > 1", &[])
-        .await;
-
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("Error retrieving rows: {:}", e);
-            return Err(e.into());
-        }
-    };
-
-    let mut interior_rings: Vec<geo_types::Polygon<f64>> = Vec::new();
-    for row in &rows {
-        let polygon: ewkb::Polygon = row.get("geom");
-        let interior_ring = Option::from_postgis(&polygon);
-        if let Some(interior_ring) = interior_ring {
-            interior_rings.push(interior_ring);
-        } else {
-            warn!("Interior ring is None for row: {:?}", row);
-        }
-    }
-    Ok((exterior_ring, interior_rings))
+fn extract_rings(polygon: &geo_types::Polygon<f64>) -> (&geo_types::LineString<f64>, &[geo_types::LineString<f64>]) {
+    let exterior_ring = polygon.exterior();
+    let interior_rings = polygon.interiors();
+    (exterior_ring, interior_rings)
 }
 
 // Simplifies the search area to the intersection of the focus polygon and the bounding rectangle defined by start and end coordinates.
@@ -463,12 +416,6 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         .await
         .expect("Failed to retrieve associated faces from database");
 
-    //TODO: extract holes with rust
-    let (exterior_ring, interior_rings) =
-        retrieve_exterior_and_interior_rings_of_focus_polygon_from_db(&client)
-            .await
-            .expect("Failed to retrieve exterior and interior rings");
-
     //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
     let transform_to_wgs84 = Proj::new_known_crs(PSEUDO_MERCATOR_CRS, WGS_84_CRS, None)
         .expect("Failed to create transformer");
@@ -514,8 +461,10 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 
+    let (exterior_ring, interior_rings) =
+        extract_rings(&focus_polygon);
+
     exterior_ring
-        .exterior()
         .points()
         .map(|p| Point2::new(p.x(), p.y()))
         .for_each(|p| {
@@ -526,9 +475,8 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     //let mut current_interior_index = vertices.len();
     let edges: Vec<[usize; 2]> = Vec::new();
 
-    for interior_ring in &interior_rings {
+    for interior_ring in interior_rings.iter() {
         let points: Vec<Point2<f64>> = interior_ring
-            .exterior()
             .points()
             .map(|p| Point2::new(p.x(), p.y()))
             .collect();
@@ -621,32 +569,6 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     }
 
     let portals = generate_portals(&polygon_path, &start_cdt, &end_cdt);
-
-    let mut portals_geo_collection = geo_types::GeometryCollection::from(
-        portals
-            .iter()
-            .map(|p| geo::Point::from(coord! {x: p.x, y: p.y }))
-            .collect::<Vec<geo::Point<f64>>>(),
-    );
-
-    portals_geo_collection
-        .transform(&transform_to_wgs84)
-        .expect("Failed to reproject geometry collection");
-
-    let portals_geo_json = Value::from(&portals_geo_collection).to_string();
-
-    let mut file = File::create("testing/portals.geojson").unwrap();
-    file.write_all(portals_geo_json.as_bytes()).unwrap();
-
-    /*     let portals_transformed_TEST = portals.iter()
-    .map(|p|
-        {
-            let mut pt = geo::Point::from(coord! {x: p.x, y: p.y });
-            pt.transform(&transform_to_wgs84).unwrap();
-            Point2::new(pt.x(), pt.y())
-        }
-    )
-    .collect::<Vec<Point2<f64>>>(); */
 
     let path = string_pull(&portals, portals.len());
 
