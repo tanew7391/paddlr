@@ -1,6 +1,5 @@
 use std::{
-    collections::HashMap,
-    ops::{Div, Mul},
+    collections::HashMap
 };
 
 //Start FaceNode
@@ -106,14 +105,35 @@ impl FaceNode<'_> {
         self.face
     }
 
-    //TODO: see if this is discarding SigFigs which could be important for pathfinding
     pub fn distance(&self, other: &FaceNode) -> u32 {
-        self.face
-            .center()
-            .distance_2(other.face.center())
-            .sqrt()
-            .mul(1000.0) // For conserving precision
-            .round()
-            .div(1000.0) as u32
+        let mut x_sum = 0.0;
+        let mut y_sum = 0.0;
+        let mut num_verticies = 0;
+        for vertex in self.face.vertices() {
+            x_sum += vertex.position().x;
+            y_sum += vertex.position().y;
+            num_verticies += 1;
+        }
+
+        let x = x_sum / num_verticies as f64;
+        let y = y_sum / num_verticies as f64;
+
+        let centroid = Point2::new(x, y);
+
+        let mut shared_edge_option = None;
+        for edge in self.face.adjacent_edges() {
+            if edge.rev().face().index().eq(&other.get_face().index()) {
+                shared_edge_option = Some(edge);
+                break;
+            }
+        }
+
+        let shared_edge_midpoint = match shared_edge_option {
+            Some(edge) => edge.center(),
+            None => return u32::MAX
+        };
+
+        shared_edge_midpoint.distance_2(centroid) as u32
+        
     }
 }
