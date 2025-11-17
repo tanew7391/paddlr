@@ -17,7 +17,7 @@ use std::{
 };
 use tokio_postgres::{Client, NoTls};
 
-use geo::{coord, BooleanOps, BoundingRect, Coord, HasDimensions, Intersects, Line, MultiPoint};
+use geo::{coord, BooleanOps, BoundingRect, Contains, Coord, GeometryCollection, HasDimensions, Intersects, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon, Rect};
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
@@ -49,9 +49,8 @@ struct ConnectionParams {
     port: String,
 }
 
-//TODO: have this take a rect
 async fn get_associated_water_features(
-    bounding_rect: &geo_types::Rect,
+    bounding_rect: &Rect,
 ) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
@@ -138,60 +137,26 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
     Ok(client)
 }
 
-async fn get_focus_polygon_from_db(
-    client: &Client,
-    mut point: geo::Point<f64>,
-) -> Result<geo_types::Polygon, Box<dyn Error>> {
-    const COLUMN_NAME: &str = "way";
-
-    point
-        .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+fn get_focus_polygon(
+    study_area: &MultiPolygon<f64>,
+    mut start_point: Coord<f64>
+) -> Result<Polygon<f64>, Box<dyn Error>> {
+    start_point.transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
         .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
-
-    let statement = format!(
-        r#"
-    SELECT {}
-    FROM planet_osm_polygon
-    WHERE "natural" = 'water'
-    AND ST_Contains(
-            way, 
-            ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 3857)
-        )
-    LIMIT 1;
-    "#,
-        COLUMN_NAME
-    );
-
-    let rows = client.query(&statement, &[&point.x(), &point.y()]).await;
-
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(e) => {
-            warn!("Error retrieving rows: {:}", e);
-            return Err(e.into());
+    
+    for polygon in study_area {
+        if polygon.contains(&start_point) {
+            return Ok(polygon.clone());
         }
-    };
+    }
 
-    debug!("Rows: {:?}", rows);
-
-    let polygon: ewkb::Polygon = rows[0].get(COLUMN_NAME);
-    let focus_polygon = Option::from_postgis(&polygon);
-
-    let focus_polygon = match focus_polygon {
-        Some(polygon) => polygon,
-        None => {
-            warn!("Could not find focus polygon! Rows[0]: {:?}", rows[0]);
-            return Err("No focus polygon found for study area!".into());
-        }
-    };
-
-    Ok(focus_polygon)
+    Err("No focus polygon found for study area!".into())
 }
 
 async fn retrieve_associated_faces_from_db(
     client: &Client,
     mut points: MultiPoint<f64>,
-) -> Result<geo_types::MultiPolygon<f64>, Box<dyn Error>> {
+) -> Result<MultiPolygon<f64>, Box<dyn Error>> {
     points
         .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
         .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
@@ -255,7 +220,7 @@ async fn retrieve_associated_faces_from_db(
 
     let multi_polygon = match geomtry {
         geo::Geometry::MultiPolygon(mp) => mp,
-        geo::Geometry::Polygon(p) => geo_types::MultiPolygon(vec![p]),
+        geo::Geometry::Polygon(p) => MultiPolygon(vec![p]),
         _ => {
             warn!("Geometry is not a multipolygon: {:?}", geomtry);
             return Err("Geometry is not a multipolygon".into());
@@ -265,7 +230,7 @@ async fn retrieve_associated_faces_from_db(
     Ok(multi_polygon)
 }
 
-fn extract_rings(polygon: &geo_types::Polygon<f64>) -> (&geo_types::LineString<f64>, &[geo_types::LineString<f64>]) {
+fn extract_rings(polygon: &Polygon<f64>) -> (&LineString<f64>, &[LineString<f64>]) {
     let exterior_ring = polygon.exterior();
     let interior_rings = polygon.interiors();
     (exterior_ring, interior_rings)
@@ -359,13 +324,15 @@ enum StopFlag {
     FullPath,
     ProcessedFaces,
     StudyArea,
+    ExteriorPolygon,
+    InteriorPolygons
 }
 
 #[derive(Deserialize, Debug)]
 struct RequestData {
     stop_flag: StopFlag,
     #[serde(deserialize_with = "deserialize_geometry")]
-    geometry: geo_types::MultiPoint<f64>,
+    geometry: MultiPoint<f64>,
 }
 
 #[post("/api", data = "<data>", format = "application/json")]
@@ -407,14 +374,10 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     let mut start_coord = start.0;
     let mut end_coord = end.0;
-
-    let mut focus_polygon = get_focus_polygon_from_db(&client, start.clone())
-        .await
-        .expect("Failed to retrieve focus polygon");
-
+    
     let mut study_area = retrieve_associated_faces_from_db(&client, contained_multipoint_geometry)
-        .await
-        .expect("Failed to retrieve associated faces from database");
+    .await
+    .expect("Failed to retrieve associated faces from database");
 
     //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
     let transform_to_wgs84 = Proj::new_known_crs(PSEUDO_MERCATOR_CRS, WGS_84_CRS, None)
@@ -432,6 +395,9 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         let focus_polygon_geojson = Value::from(&study_area).to_string();
         return Ok(focus_polygon_geojson);
     }
+
+    let mut focus_polygon = get_focus_polygon(&study_area, start_coord.clone())
+        .expect("Failed to retrieve focus polygon");
 
     if data.stop_flag == StopFlag::FocusPolygon {
         info!("Returning focus polygon as GeoJSON");
@@ -464,6 +430,28 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     let (exterior_ring, interior_rings) =
         extract_rings(&focus_polygon);
 
+    if data.stop_flag == StopFlag::ExteriorPolygon {
+        info!("Returning exterior polygon as GeoJSON");
+        let mut owned_ext_ring = exterior_ring
+            .to_owned();
+        owned_ext_ring
+            .transform(&transform_to_wgs84)
+            .expect("Failed to reproject focus polygon");
+        let exterior_polygon_geojson = Value::from(&owned_ext_ring).to_string();
+        return Ok(exterior_polygon_geojson);
+    }
+
+    if data.stop_flag == StopFlag::InteriorPolygons {
+        info!("Returning exterior polygon as GeoJSON");
+        
+        let mut multi_line_string= MultiLineString::new(interior_rings.to_vec());
+        multi_line_string
+            .transform(&transform_to_wgs84)
+            .expect("Failed to reproject focus polygon");
+        let interior_polygon_geojson = Value::from(&multi_line_string).to_string();
+        return Ok(interior_polygon_geojson);
+    }
+
     exterior_ring
         .points()
         .map(|p| Point2::new(p.x(), p.y()))
@@ -472,7 +460,6 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
                 .expect(&format!("Unable to insert a vertex? {:?}", p));
         });
 
-    //let mut current_interior_index = vertices.len();
     let edges: Vec<[usize; 2]> = Vec::new();
 
     for interior_ring in interior_rings.iter() {
@@ -507,11 +494,9 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         focus_polygon.exterior().points().len()
     );
 
-    //End Temp
-
     if data.stop_flag == StopFlag::Triangulation {
         info!("Returning as GeoJSON");
-        let triangulation: geo_types::MultiPolygon<f64> = cdt
+        let triangulation: MultiPolygon<f64> = cdt
             .inner_faces()
             .map(|face_handle| {
                 let face_node = FaceNode::new(face_handle);
@@ -535,7 +520,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     if data.stop_flag == StopFlag::ProcessedFaces {
         info!("Returning processed faces as GeoJSON");
-        let multipolygon_path: geo_types::MultiPolygon<f64> = polygon_path
+        let multipolygon_path: MultiPolygon<f64> = polygon_path
             .iter()
             .map(|face_node| {
                 let mut geom = face_to_polygon(face_node);
@@ -555,7 +540,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     if data.stop_flag == StopFlag::TriangulationPathfinding {
         info!("Returning triangulation path as GeoJSON");
-        let multipolygon_path: geo_types::MultiPolygon<f64> = polygon_path
+        let multipolygon_path: MultiPolygon<f64> = polygon_path
             .iter()
             .map(|face_node| {
                 let mut geom = face_to_polygon(face_node);
@@ -587,7 +572,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         }
     });
 
-    let mut line = geo_types::GeometryCollection::from(test);
+    let mut line = GeometryCollection::from(test);
 
     line.transform(&transform_to_wgs84)
         .expect("Failed to reproject geometry collection");
@@ -596,24 +581,23 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
     Ok(info_string)
 }
 
-fn face_to_polygon(face_node: &FaceNode) -> geo_types::Polygon<f64> {
+fn face_to_polygon(face_node: &FaceNode) -> Polygon<f64> {
     let face = face_node.get_face();
     let vertices = face.positions();
-    let linestring = geo_types::LineString::from(
+    let linestring = LineString::from(
         vertices
             .into_iter()
             .map(|c| Coord { x: c.x, y: c.y })
             .collect::<Vec<Coord<f64>>>(),
     );
-    geo_types::Polygon::new(linestring, vec![])
+    Polygon::new(linestring, vec![])
 }
-//End FaceNode
 
 fn compute_a_star_pathfinding_from_delaney<'a>(
     start: Point2<f64>,
     end: Point2<f64>,
     cdt: &'a ConstrainedDelaunayTriangulation<Point2<f64>>,
-    focus_polygon: &geo_types::Polygon<f64>,
+    focus_polygon: &Polygon<f64>,
     return_processed_faces: bool,
 ) -> Vec<FaceNode<'a>> {
     let mut processed_face_indices: HashMap<usize, FaceNodeType> = HashMap::new();
@@ -637,7 +621,7 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
         end_face_handle = Some(face_handle);
     } else {
         info!("Not on face, {:?}", position_in_triangulation);
-        panic!("Start point is not on a face, no way to handle this yet");
+        panic!("End point is not on a face, no way to handle this yet");
         //TODO handle by assigning the face to one of the adjacent faces to this point, it should be on a line if not a face
     }
 
@@ -710,7 +694,7 @@ fn generate_portals(
         for current_edge in current_face.adjacent_edges() {
             for next_face_edge in next_face.adjacent_edges() {
                 if current_edge.rev() == next_face_edge {
-                    //This order matters. TODO: see if producing correct portals
+                    //This order matters
                     portals.push(current_edge.to().position());
                     portals.push(current_edge.from().position());
                 }
@@ -730,6 +714,8 @@ fn vequal(a: &Point2<f64>, b: &Point2<f64>) -> bool {
     let equal = ((b.x as f32 - a.x as f32) * (b.x as f32 - a.x as f32)
         + (b.y as f32 - a.y as f32) * (b.y as f32 - a.y as f32))
         < tolerance;
+
+
     equal
 }
 
@@ -823,14 +809,14 @@ fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>
 }
 
 //TODO: test
-fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> geo_types::Polygon<f64> {
-    let linestring = geo_types::LineString::from(
+fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> Polygon<f64> {
+    let linestring = LineString::from(
         face_positions
             .into_iter()
             .map(|c| Coord { x: c.x, y: c.y })
             .collect::<Vec<Coord<f64>>>(),
     );
-    geo_types::Polygon::new(linestring, vec![])
+    Polygon::new(linestring, vec![])
 }
 
 #[launch]
