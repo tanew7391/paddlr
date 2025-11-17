@@ -27,7 +27,6 @@ use spade::{
 };
 use std::{collections::HashMap, error::Error, vec};
 
-use env_logger;
 use log::{self, debug, info, warn};
 
 use geojson::de::deserialize_geometry;
@@ -265,7 +264,7 @@ fn simplify_search_area(
 
     info!("Start or end point is not contained within the intersection polygon.");
 
-    return None;
+    None
 }
 
 fn get_connection_params() -> ConnectionParams {
@@ -398,7 +397,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         return Ok(focus_polygon_geojson);
     }
 
-    let mut focus_polygon = get_focus_polygon(&study_area, start_coord.clone())
+    let mut focus_polygon = get_focus_polygon(&study_area, start_coord)
         .expect("Failed to retrieve focus polygon");
 
     if data.stop_flag == StopFlag::FocusPolygon {
@@ -457,7 +456,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         .map(|p| Point2::new(p.x(), p.y()))
         .for_each(|p| {
             cdt.insert(p)
-                .expect(&format!("Unable to insert a vertex? {:?}", p));
+                .unwrap_or_else(|_| panic!("Unable to insert a vertex? {:?}", p));
         });
 
     let edges: Vec<[usize; 2]> = Vec::new();
@@ -471,7 +470,7 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
         for i in 0..points.len() {
             let new_edge: [Point2<f64>; 2] = [points[i], points[(i + 1) % points.len()]];
             cdt.add_constraint_edge(new_edge[0], new_edge[1])
-                .expect(&format!("Unable to add constraint edge: {:?}", new_edge));
+                .unwrap_or_else(|_| panic!("Unable to add constraint edge: {:?}", new_edge));
         }
     }
 
@@ -652,15 +651,15 @@ fn compute_a_star_pathfinding_from_delaney<'a>(
         return processed_faces;
     }
 
-    let a_star_results = match a_star_results {
+    
+
+    match a_star_results {
         Some((path, _cost)) => path,
         None => {
             info!("No path found");
-            return vec![];
+            vec![]
         }
-    };
-
-    a_star_results
+    }
 }
 
 fn triangle_area_2(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f32 {
@@ -668,8 +667,8 @@ fn triangle_area_2(a: &Point2<f64>, b: &Point2<f64>, c: &Point2<f64>) -> f32 {
     let ay = b.y as f32 - a.y as f32;
     let bx = c.x as f32 - a.x as f32;
     let by = c.y as f32 - a.y as f32;
-    let cross_product = bx * ay - ax * by;
-    cross_product as f32
+    
+    bx * ay - ax * by
 }
 
 fn generate_portals(
@@ -678,8 +677,8 @@ fn generate_portals(
     end_node: &Point2<f64>,
 ) -> Vec<Point2<f64>> {
     let mut portals: Vec<Point2<f64>> = Vec::new();
-    portals.push(start_node.clone());
-    portals.push(start_node.clone());
+    portals.push(*start_node);
+    portals.push(*start_node);
     for i in 0..face_nodes.len() {
         let current = &face_nodes[i];
         let next = face_nodes.get(i + 1);
@@ -702,8 +701,8 @@ fn generate_portals(
         }
     }
 
-    portals.push(end_node.clone());
-    portals.push(end_node.clone());
+    portals.push(*end_node);
+    portals.push(*end_node);
 
     portals
 }
@@ -711,11 +710,11 @@ fn generate_portals(
 fn vequal(a: &Point2<f64>, b: &Point2<f64>) -> bool {
     let tolerance = 0.001 * 0.001;
 
-    let equal = ((b.x as f32 - a.x as f32) * (b.x as f32 - a.x as f32)
-        + (b.y as f32 - a.y as f32) * (b.y as f32 - a.y as f32))
-        < tolerance;
+    
 
-    equal
+    ((b.x as f32 - a.x as f32) * (b.x as f32 - a.x as f32)
+        + (b.y as f32 - a.y as f32) * (b.y as f32 - a.y as f32))
+        < tolerance
 }
 
 fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>> {
@@ -731,7 +730,7 @@ fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>
 
     let mut i = 1;
     while (i < portals.len()) && (points.len() < max_points) {
-        i = i + 1;
+        i += 1;
         let left = portals.get(i * 2);
         let right = portals.get((i * 2) + 1);
 
@@ -799,7 +798,7 @@ fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>
     }
 
     if points.len() < max_points {
-        points.push(portals.last().unwrap().clone());
+        points.push(*portals.last().unwrap());
     }
 
     info!("String Pull Points len: {:}", points.len());
@@ -811,7 +810,7 @@ fn string_pull(portals: &Vec<Point2<f64>>, max_points: usize) -> Vec<Point2<f64>
 fn cdt_face_to_polygon(face_positions: &[Point2<f64>; 3]) -> Polygon<f64> {
     let linestring = LineString::from(
         face_positions
-            .into_iter()
+            .iter()
             .map(|c| Coord { x: c.x, y: c.y })
             .collect::<Vec<Coord<f64>>>(),
     );

@@ -64,15 +64,15 @@ impl<'a> FaceNode<'a> {
 
             let adjacent_face_index = adjacent_face.index();
 
-            if !checked_faces.contains_key(&adjacent_face_index) {
+            checked_faces.entry(adjacent_face_index).or_insert_with(|| {
                 //We need only process the faces that are inside the focus polygon
                 //TODO: This is a very expensive operation - working on this would improve performance
-                let face_node_type = match focus_polygon.contains(&adjacent_center_point) {
+                
+                match focus_polygon.contains(&adjacent_center_point) {
                     true => FaceNodeType::Inner,
                     false => FaceNodeType::Outer,
-                };
-                checked_faces.insert(adjacent_face_index, face_node_type);
-            }
+                }
+            });
 
             if checked_faces[&adjacent_face_index] == FaceNodeType::Outer {
                 //We need only process the faces that are inside the focus polygon
