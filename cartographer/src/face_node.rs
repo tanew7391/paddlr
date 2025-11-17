@@ -1,6 +1,4 @@
-use std::{
-    collections::HashMap
-};
+use std::collections::HashMap;
 
 //Start FaceNode
 use geo::{Contains, Coord};
@@ -130,10 +128,9 @@ impl FaceNode<'_> {
 
         let shared_edge_midpoint = match shared_edge_option {
             Some(edge) => edge.center(),
-            None => return u32::MAX
+            None => return u32::MAX,
         };
 
         shared_edge_midpoint.distance_2(centroid) as u32
-        
     }
 }

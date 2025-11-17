@@ -12,12 +12,15 @@ use spade::PositionInTriangulation::OnFace;
 use std::{
     env,
     fs::File,
-    io::{Write},
+    io::Write,
     process::{Command, Stdio},
 };
 use tokio_postgres::{Client, NoTls};
 
-use geo::{coord, BooleanOps, BoundingRect, Contains, Coord, GeometryCollection, HasDimensions, Intersects, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon, Rect};
+use geo::{
+    coord, BooleanOps, BoundingRect, Contains, Coord, GeometryCollection, HasDimensions,
+    Intersects, Line, LineString, MultiLineString, MultiPoint, MultiPolygon, Polygon, Rect,
+};
 use spade::{
     handles::{FixedFaceHandle, InnerTag},
     ConstrainedDelaunayTriangulation, Point2, Triangulation,
@@ -49,9 +52,7 @@ struct ConnectionParams {
     port: String,
 }
 
-async fn get_associated_water_features(
-    bounding_rect: &Rect,
-) -> Result<String, Box<dyn Error>> {
+async fn get_associated_water_features(bounding_rect: &Rect) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
 
     let bounding_rect_as_string = format!(
@@ -139,11 +140,12 @@ async fn get_connected_client() -> Result<tokio_postgres::Client, Box<dyn Error>
 
 fn get_focus_polygon(
     study_area: &MultiPolygon<f64>,
-    mut start_point: Coord<f64>
+    mut start_point: Coord<f64>,
 ) -> Result<Polygon<f64>, Box<dyn Error>> {
-    start_point.transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
+    start_point
+        .transform_crs_to_crs(WGS_84_CRS, PSEUDO_MERCATOR_CRS)
         .expect("Failed to transform user multipoint geometry to Pseudo-Mercator CRS");
-    
+
     for polygon in study_area {
         if polygon.contains(&start_point) {
             return Ok(polygon.clone());
@@ -325,7 +327,7 @@ enum StopFlag {
     ProcessedFaces,
     StudyArea,
     ExteriorPolygon,
-    InteriorPolygons
+    InteriorPolygons,
 }
 
 #[derive(Deserialize, Debug)]
@@ -374,10 +376,10 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     let mut start_coord = start.0;
     let mut end_coord = end.0;
-    
+
     let mut study_area = retrieve_associated_faces_from_db(&client, contained_multipoint_geometry)
-    .await
-    .expect("Failed to retrieve associated faces from database");
+        .await
+        .expect("Failed to retrieve associated faces from database");
 
     //Attention: This needs to be below ANY .awaits or the function will not work because Proj does not support async
     let transform_to_wgs84 = Proj::new_known_crs(PSEUDO_MERCATOR_CRS, WGS_84_CRS, None)
@@ -427,13 +429,11 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     let mut cdt = ConstrainedDelaunayTriangulation::<Point2<_>>::new();
 
-    let (exterior_ring, interior_rings) =
-        extract_rings(&focus_polygon);
+    let (exterior_ring, interior_rings) = extract_rings(&focus_polygon);
 
     if data.stop_flag == StopFlag::ExteriorPolygon {
         info!("Returning exterior polygon as GeoJSON");
-        let mut owned_ext_ring = exterior_ring
-            .to_owned();
+        let mut owned_ext_ring = exterior_ring.to_owned();
         owned_ext_ring
             .transform(&transform_to_wgs84)
             .expect("Failed to reproject focus polygon");
@@ -443,8 +443,8 @@ async fn index(data: Json<RequestData>) -> Result<String, rocket::http::Status> 
 
     if data.stop_flag == StopFlag::InteriorPolygons {
         info!("Returning exterior polygon as GeoJSON");
-        
-        let mut multi_line_string= MultiLineString::new(interior_rings.to_vec());
+
+        let mut multi_line_string = MultiLineString::new(interior_rings.to_vec());
         multi_line_string
             .transform(&transform_to_wgs84)
             .expect("Failed to reproject focus polygon");
@@ -714,7 +714,6 @@ fn vequal(a: &Point2<f64>, b: &Point2<f64>) -> bool {
     let equal = ((b.x as f32 - a.x as f32) * (b.x as f32 - a.x as f32)
         + (b.y as f32 - a.y as f32) * (b.y as f32 - a.y as f32))
         < tolerance;
-
 
     equal
 }
